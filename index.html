@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Wireframe Renderer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            color: #fff;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+            text-shadow: 0 0 20px rgba(0, 255, 255, 0.5);
+            color: #00ffff;
+        }
+
+        .controls {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        label {
+            font-size: 12px;
+            color: #aaa;
+            text-transform: uppercase;
+        }
+
+        select, input[type="range"] {
+            padding: 10px 15px;
+            border: 2px solid #00ffff;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.5);
+            color: #fff;
+            font-size: 14px;
+            cursor: pointer;
+            min-width: 200px;
+        }
+
+        select:hover, select:focus {
+            background: rgba(0, 255, 255, 0.1);
+            outline: none;
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            height: 10px;
+            padding: 0;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 20px;
+            height: 20px;
+            background: #00ffff;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        canvas {
+            border: 2px solid #00ffff;
+            border-radius: 12px;
+            box-shadow: 0 0 30px rgba(0, 255, 255, 0.3);
+            background: rgba(0, 0, 0, 0.8);
+        }
+
+        .info {
+            margin-top: 20px;
+            padding: 15px 25px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 8px;
+            border: 1px solid #00ffff;
+            max-width: 800px;
+            text-align: center;
+        }
+
+        .info h3 {
+            color: #00ffff;
+            margin-bottom: 10px;
+        }
+
+        .info p {
+            color: #ccc;
+            line-height: 1.6;
+        }
+
+        .stats {
+            margin-top: 15px;
+            display: flex;
+            gap: 30px;
+            justify-content: center;
+            font-size: 12px;
+            color: #888;
+        }
+
+        .stats span {
+            color: #00ffff;
+        }
+    </style>
+</head>
+<body>
+    <h1>3D Wireframe Renderer</h1>
+
+    <div class="controls">
+        <div class="control-group">
+            <label>Select Shape</label>
+            <select id="shapeSelect">
+                <option value="0">Hypercube (Tesseract Projection)</option>
+                <option value="1">DNA Double Helix</option>
+                <option value="2">Pulsating Icosahedron</option>
+                <option value="3">Lorenz Attractor</option>
+                <option value="4">Morphing Torus Knot</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label>Rotation Speed</label>
+            <input type="range" id="speedSlider" min="0" max="200" value="100">
+        </div>
+
+        <div class="control-group">
+            <label>Zoom</label>
+            <input type="range" id="zoomSlider" min="50" max="300" value="150">
+        </div>
+    </div>
+
+    <canvas id="canvas" width="800" height="600"></canvas>
+
+    <div class="info">
+        <h3 id="shapeName">Hypercube (Tesseract Projection)</h3>
+        <p id="shapeDescription">A tesseract is a 4-dimensional hypercube projected into 3D space. Watch as it rotates through the 4th dimension, creating seemingly impossible geometric transformations.</p>
+        <div class="stats">
+            <div>Vertices: <span id="vertexCount">0</span></div>
+            <div>Edges: <span id="edgeCount">0</span></div>
+            <div>FPS: <span id="fps">0</span></div>
+        </div>
+    </div>
+
+    <script>
+        // ============================================
+        // 3D Wireframe Renderer Engine
+        // ============================================
+
+        class WireframeRenderer {
+            constructor(canvas) {
+                this.canvas = canvas;
+                this.ctx = canvas.getContext('2d');
+                this.width = canvas.width;
+                this.height = canvas.height;
+                this.centerX = this.width / 2;
+                this.centerY = this.height / 2;
+
+                // Camera and projection settings
+                this.focalLength = 400;
+                this.zoom = 150;
+                this.cameraZ = 5;
+
+                // Rotation angles
+                this.rotationX = 0;
+                this.rotationY = 0;
+                this.rotationZ = 0;
+                this.rotationSpeed = 1;
+
+                // Current shape data
+                this.vertices = [];
+                this.edges = [];
+                this.colors = [];
+
+                // Animation
+                this.time = 0;
+                this.animationId = null;
+                this.currentShape = 0;
+                this.shapeGenerators = [
+                    this.generateHypercube.bind(this),
+                    this.generateDNAHelix.bind(this),
+                    this.generatePulsatingIcosahedron.bind(this),
+                    this.generateLorenzAttractor.bind(this),
+                    this.generateTorusKnot.bind(this)
+                ];
+
+                // FPS tracking
+                this.lastTime = performance.now();
+                this.frameCount = 0;
+                this.fps = 0;
+            }
+
+            // Matrix operations for 3D transformations
+            rotateX(point, angle) {
+                const cos = Math.cos(angle);
+                const sin = Math.sin(angle);
+                return [
+                    point[0],
+                    point[1] * cos - point[2] * sin,
+                    point[1] * sin + point[2] * cos
+                ];
+            }
+
+            rotateY(point, angle) {
+                const cos = Math.cos(angle);
+                const sin = Math.sin(angle);
+                return [
+                    point[0] * cos + point[2] * sin,
+                    point[1],
+                    -point[0] * sin + point[2] * cos
+                ];
+            }
+
+            rotateZ(point, angle) {
+                const cos = Math.cos(angle);
+                const sin = Math.sin(angle);
+                return [
+                    point[0] * cos - point[1] * sin,
+                    point[0] * sin + point[1] * cos,
+                    point[2]
+                ];
+            }
+
+            // 4D rotation for hypercube
+            rotateW(point4D, angle) {
+                const cos = Math.cos(angle);
+                const sin = Math.sin(angle);
+                return [
+                    point4D[0],
+                    point4D[1],
+                    point4D[2] * cos - point4D[3] * sin,
+                    point4D[2] * sin + point4D[3] * cos
+                ];
+            }
+
+            rotateXW(point4D, angle) {
+                const cos = Math.cos(angle);
+                const sin = Math.sin(angle);
+                return [
+                    point4D[0] * cos - point4D[3] * sin,
+                    point4D[1],
+                    point4D[2],
+                    point4D[0] * sin + point4D[3] * cos
+                ];
+            }
+
+            // Project 3D point to 2D screen
+            project(point) {
+                const z = point[2] + this.cameraZ;
+                const scale = this.focalLength / (this.focalLength + z);
+                return [
+                    point[0] * scale * this.zoom + this.centerX,
+                    point[1] * scale * this.zoom + this.centerY,
+                    scale // For depth-based effects
+                ];
+            }
+
+            // Project 4D to 3D (for hypercube)
+            project4Dto3D(point4D, w = 2) {
+                const scale = 1 / (w - point4D[3]);
+                return [
+                    point4D[0] * scale,
+                    point4D[1] * scale,
+                    point4D[2] * scale
+                ];
+            }
+
+            // ============================================
+            // Shape Generators
+            // ============================================
+
+            generateHypercube(time) {
+                // Generate 4D hypercube vertices
+                const vertices4D = [];
+                for (let i = 0; i < 16; i++) {
+                    vertices4D.push([
+                        (i & 1) ? 1 : -1,
+                        (i & 2) ? 1 : -1,
+                        (i & 4) ? 1 : -1,
+                        (i & 8) ? 1 : -1
+                    ]);
+                }
+
+                // Rotate in 4D space
+                const rotatedVertices4D = vertices4D.map(v => {
+                    let rotated = this.rotateW(v, time * 0.5);
+                    rotated = this.rotateXW(rotated, time * 0.3);
+                    return rotated;
+                });
+
+                // Project to 3D
+                this.vertices = rotatedVertices4D.map(v => this.project4Dto3D(v, 3));
+
+                // Generate edges (connect vertices that differ by one bit)
+                this.edges = [];
+                this.colors = [];
+                for (let i = 0; i < 16; i++) {
+                    for (let j = i + 1; j < 16; j++) {
+                        const xor = i ^ j;
+                        if ((xor & (xor - 1)) === 0) { // Power of 2 = single bit difference
+                            this.edges.push([i, j]);
+                            // Color based on which dimension the edge spans
+                            const dim = Math.log2(xor);
+                            const hue = (dim * 90 + time * 30) % 360;
+                            this.colors.push(`hsl(${hue}, 100%, 60%)`);
+                        }
+                    }
+                }
+            }
+
+            generateDNAHelix(time) {
+                this.vertices = [];
+                this.edges = [];
+                this.colors = [];
+
+                const segments = 40;
+                const radius = 1;
+                const height = 4;
+                const twist = 2;
+
+                // Generate two helixes
+                for (let i = 0; i < segments; i++) {
+                    const t = i / segments;
+                    const angle = t * Math.PI * 2 * twist + time;
+                    const y = t * height - height / 2;
+
+                    // Helix 1
+                    this.vertices.push([
+                        Math.cos(angle) * radius,
+                        y,
+                        Math.sin(angle) * radius
+                    ]);
+
+                    // Helix 2 (offset by PI)
+                    this.vertices.push([
+                        Math.cos(angle + Math.PI) * radius,
+                        y,
+                        Math.sin(angle + Math.PI) * radius
+                    ]);
+                }
+
+                // Connect helix strands
+                for (let i = 0; i < segments - 1; i++) {
+                    // Strand 1 connections
+                    this.edges.push([i * 2, (i + 1) * 2]);
+                    this.colors.push('#00ffff');
+
+                    // Strand 2 connections
+                    this.edges.push([i * 2 + 1, (i + 1) * 2 + 1]);
+                    this.colors.push('#ff00ff');
+
+                    // Base pairs (rungs)
+                    if (i % 4 === 0) {
+                        this.edges.push([i * 2, i * 2 + 1]);
+                        this.colors.push(`hsl(${(i * 20 + time * 50) % 360}, 100%, 70%)`);
+                    }
+                }
+            }
+
+            generatePulsatingIcosahedron(time) {
+                // Golden ratio
+                const phi = (1 + Math.sqrt(5)) / 2;
+                const pulseFactor = 1 + Math.sin(time * 2) * 0.3;
+
+                // Icosahedron base vertices
+                const baseVertices = [
+                    [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+                    [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+                    [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]
+                ];
+
+                // Apply pulsation with wave effect
+                this.vertices = baseVertices.map((v, i) => {
+                    const phase = i * 0.5 + time * 3;
+                    const localPulse = 1 + Math.sin(phase) * 0.2;
+                    const scale = pulseFactor * localPulse * 0.8;
+                    return [v[0] * scale, v[1] * scale, v[2] * scale];
+                });
+
+                // Icosahedron edges
+                this.edges = [
+                    [0, 1], [0, 5], [0, 7], [0, 10], [0, 11],
+                    [1, 5], [1, 7], [1, 8], [1, 9],
+                    [2, 3], [2, 4], [2, 6], [2, 10], [2, 11],
+                    [3, 4], [3, 6], [3, 8], [3, 9],
+                    [4, 5], [4, 9], [4, 11],
+                    [5, 9], [5, 11],
+                    [6, 7], [6, 8], [6, 10],
+                    [7, 8], [7, 10],
+                    [8, 9],
+                    [10, 11]
+                ];
+
+                // Dynamic colors
+                this.colors = this.edges.map((e, i) => {
+                    const hue = (i * 12 + time * 60) % 360;
+                    return `hsl(${hue}, 100%, 60%)`;
+                });
+            }
+
+            generateLorenzAttractor(time) {
+                this.vertices = [];
+                this.edges = [];
+                this.colors = [];
+
+                // Lorenz system parameters
+                const sigma = 10;
+                const rho = 28;
+                const beta = 8 / 3;
+                const dt = 0.005;
+
+                // Starting point (animated)
+                let x = 0.1 + Math.sin(time * 0.1) * 0.01;
+                let y = 0;
+                let z = 0;
+
+                const points = 2000;
+                const scale = 0.05;
+
+                // Generate Lorenz attractor points
+                for (let i = 0; i < points; i++) {
+                    const dx = sigma * (y - x);
+                    const dy = x * (rho - z) - y;
+                    const dz = x * y - beta * z;
+
+                    x += dx * dt;
+                    y += dy * dt;
+                    z += dz * dt;
+
+                    this.vertices.push([x * scale, (z - 25) * scale, y * scale]);
+
+                    if (i > 0) {
+                        this.edges.push([i - 1, i]);
+                        // Color based on position and time
+                        const hue = (i * 0.2 + time * 30) % 360;
+                        this.colors.push(`hsl(${hue}, 80%, 55%)`);
+                    }
+                }
+            }
+
+            generateTorusKnot(time) {
+                this.vertices = [];
+                this.edges = [];
+                this.colors = [];
+
+                // Torus knot parameters (p, q determine the knot type)
+                const p = 3;
+                const q = 2 + Math.sin(time * 0.5); // Morphing parameter
+                const segments = 200;
+                const R = 1.5;
+                const r = 0.6;
+
+                for (let i = 0; i < segments; i++) {
+                    const t = (i / segments) * Math.PI * 2 * p;
+                    const phi = t * q / p;
+
+                    // Parametric torus knot equations
+                    const scale = R + r * Math.cos(phi);
+                    const x = scale * Math.cos(t);
+                    const y = scale * Math.sin(t);
+                    const z = r * Math.sin(phi);
+
+                    // Add twist animation
+                    const twist = time * 0.5;
+                    const twisted = this.rotateZ([x, y, z], twist * Math.sin(t * 0.5));
+
+                    this.vertices.push(twisted);
+
+                    if (i > 0) {
+                        this.edges.push([i - 1, i]);
+                    }
+                }
+                // Close the loop
+                this.edges.push([segments - 1, 0]);
+
+                // Rainbow colors
+                this.colors = this.edges.map((e, i) => {
+                    const hue = (i * 360 / segments + time * 50) % 360;
+                    return `hsl(${hue}, 100%, 60%)`;
+                });
+            }
+
+            // ============================================
+            // Rendering
+            // ============================================
+
+            render() {
+                // Clear canvas
+                this.ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+                this.ctx.fillRect(0, 0, this.width, this.height);
+
+                // Transform and project all vertices
+                const projectedVertices = this.vertices.map(v => {
+                    let rotated = this.rotateX(v, this.rotationX);
+                    rotated = this.rotateY(rotated, this.rotationY);
+                    rotated = this.rotateZ(rotated, this.rotationZ);
+                    return this.project(rotated);
+                });
+
+                // Sort edges by depth for proper rendering
+                const edgesWithDepth = this.edges.map((edge, i) => {
+                    const z1 = projectedVertices[edge[0]][2];
+                    const z2 = projectedVertices[edge[1]][2];
+                    return { edge, color: this.colors[i] || '#00ffff', depth: (z1 + z2) / 2 };
+                });
+                edgesWithDepth.sort((a, b) => a.depth - b.depth);
+
+                // Draw edges
+                edgesWithDepth.forEach(({ edge, color, depth }) => {
+                    const p1 = projectedVertices[edge[0]];
+                    const p2 = projectedVertices[edge[1]];
+
+                    // Skip if behind camera
+                    if (p1[2] < 0 || p2[2] < 0) return;
+
+                    // Depth-based opacity
+                    const opacity = 0.3 + depth * 0.7;
+
+                    this.ctx.beginPath();
+                    this.ctx.moveTo(p1[0], p1[1]);
+                    this.ctx.lineTo(p2[0], p2[1]);
+                    this.ctx.strokeStyle = color;
+                    this.ctx.lineWidth = 1 + depth * 2;
+                    this.ctx.globalAlpha = Math.min(1, opacity);
+                    this.ctx.stroke();
+                });
+
+                // Draw vertices as glowing points
+                this.ctx.globalAlpha = 1;
+                projectedVertices.forEach((p, i) => {
+                    if (p[2] < 0) return;
+
+                    const radius = 2 + p[2] * 3;
+
+                    // Glow effect
+                    const gradient = this.ctx.createRadialGradient(p[0], p[1], 0, p[0], p[1], radius * 2);
+                    gradient.addColorStop(0, 'rgba(255, 255, 255, 0.8)');
+                    gradient.addColorStop(0.5, 'rgba(0, 255, 255, 0.4)');
+                    gradient.addColorStop(1, 'rgba(0, 255, 255, 0)');
+
+                    this.ctx.beginPath();
+                    this.ctx.arc(p[0], p[1], radius * 2, 0, Math.PI * 2);
+                    this.ctx.fillStyle = gradient;
+                    this.ctx.fill();
+                });
+
+                // Update stats
+                this.frameCount++;
+                const now = performance.now();
+                if (now - this.lastTime >= 1000) {
+                    this.fps = this.frameCount;
+                    this.frameCount = 0;
+                    this.lastTime = now;
+                    document.getElementById('fps').textContent = this.fps;
+                }
+
+                document.getElementById('vertexCount').textContent = this.vertices.length;
+                document.getElementById('edgeCount').textContent = this.edges.length;
+            }
+
+            // Animation loop
+            animate() {
+                this.time += 0.016 * this.rotationSpeed;
+
+                // Generate current shape
+                this.shapeGenerators[this.currentShape](this.time);
+
+                // Auto-rotate
+                this.rotationY += 0.005 * this.rotationSpeed;
+                this.rotationX += 0.002 * this.rotationSpeed;
+
+                this.render();
+                this.animationId = requestAnimationFrame(() => this.animate());
+            }
+
+            start() {
+                if (!this.animationId) {
+                    this.animate();
+                }
+            }
+
+            stop() {
+                if (this.animationId) {
+                    cancelAnimationFrame(this.animationId);
+                    this.animationId = null;
+                }
+            }
+
+            setShape(index) {
+                this.currentShape = index;
+                this.time = 0;
+                this.rotationX = 0;
+                this.rotationY = 0;
+                this.rotationZ = 0;
+
+                // Clear canvas for new shape
+                this.ctx.fillStyle = 'rgba(0, 0, 0, 1)';
+                this.ctx.fillRect(0, 0, this.width, this.height);
+            }
+
+            setSpeed(speed) {
+                this.rotationSpeed = speed / 100;
+            }
+
+            setZoom(zoom) {
+                this.zoom = zoom;
+            }
+        }
+
+        // ============================================
+        // Shape Descriptions
+        // ============================================
+
+        const shapeInfo = [
+            {
+                name: "Hypercube (Tesseract Projection)",
+                description: "A tesseract is a 4-dimensional hypercube projected into 3D space. Watch as it rotates through the 4th dimension, creating seemingly impossible geometric transformations. The inner and outer cubes are connected by edges spanning the 4th dimension."
+            },
+            {
+                name: "DNA Double Helix",
+                description: "A representation of the iconic DNA molecule structure. Two intertwined helical strands are connected by 'base pairs' (the horizontal rungs). The animation shows the continuous rotation that reveals the molecule's elegant twisted ladder structure."
+            },
+            {
+                name: "Pulsating Icosahedron",
+                description: "An icosahedron is a Platonic solid with 20 triangular faces. This version pulses with a wave effect, where each vertex oscillates at a slightly different phase, creating a breathing, organic appearance while maintaining its geometric perfection."
+            },
+            {
+                name: "Lorenz Attractor",
+                description: "The famous 'butterfly' chaotic attractor discovered by Edward Lorenz. It demonstrates how deterministic systems can produce unpredictable behavior. The path never repeats exactly, creating an infinitely complex pattern in a finite space."
+            },
+            {
+                name: "Morphing Torus Knot",
+                description: "A torus knot is a knot that lies on the surface of a torus. This version continuously morphs its parameters, transitioning smoothly between different knot configurations while adding a twist animation that emphasizes its 3D structure."
+            }
+        ];
+
+        // ============================================
+        // Initialize Application
+        // ============================================
+
+        const canvas = document.getElementById('canvas');
+        const renderer = new WireframeRenderer(canvas);
+
+        // Event listeners
+        document.getElementById('shapeSelect').addEventListener('change', (e) => {
+            const index = parseInt(e.target.value);
+            renderer.setShape(index);
+            document.getElementById('shapeName').textContent = shapeInfo[index].name;
+            document.getElementById('shapeDescription').textContent = shapeInfo[index].description;
+        });
+
+        document.getElementById('speedSlider').addEventListener('input', (e) => {
+            renderer.setSpeed(parseInt(e.target.value));
+        });
+
+        document.getElementById('zoomSlider').addEventListener('input', (e) => {
+            renderer.setZoom(parseInt(e.target.value));
+        });
+
+        // Mouse interaction for manual rotation
+        let isDragging = false;
+        let lastMouseX, lastMouseY;
+
+        canvas.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (isDragging) {
+                const deltaX = e.clientX - lastMouseX;
+                const deltaY = e.clientY - lastMouseY;
+                renderer.rotationY += deltaX * 0.01;
+                renderer.rotationX += deltaY * 0.01;
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+            }
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            isDragging = false;
+        });
+
+        // Touch support
+        canvas.addEventListener('touchstart', (e) => {
+            isDragging = true;
+            lastMouseX = e.touches[0].clientX;
+            lastMouseY = e.touches[0].clientY;
+        });
+
+        canvas.addEventListener('touchmove', (e) => {
+            if (isDragging) {
+                const deltaX = e.touches[0].clientX - lastMouseX;
+                const deltaY = e.touches[0].clientY - lastMouseY;
+                renderer.rotationY += deltaX * 0.01;
+                renderer.rotationX += deltaY * 0.01;
+                lastMouseX = e.touches[0].clientX;
+                lastMouseY = e.touches[0].clientY;
+                e.preventDefault();
+            }
+        });
+
+        canvas.addEventListener('touchend', () => {
+            isDragging = false;
+        });
+
+        // Start rendering
+        renderer.start();
+    </script>
+</body>
+</html>
