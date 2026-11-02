@@ -796,7 +796,7 @@ in vec2 vXZ;
 uniform vec3 uCamPos, uSunDir, uSunE;
 uniform vec2 uUnresolved;
 uniform vec3 uBetaExt;
-uniform float uFilter, uFoamOn, uDebug, uHs;
+uniform float uFilter, uFoamOn, uDebug, uHs, uDepth;
 uniform sampler2D uSlope0, uSlope1, uSlope2, uFoam0, uFoam1, uWakeSlope, uWakeFoam;
 out vec4 o;
 
@@ -884,7 +884,14 @@ void main() {
     // Light from below the surface + forward scattering through thin crests
     vec3 skyAmb = textureLod(uSky, vec2(0.5, 0.85), 9.0).rgb * PI;
     vec3 seaColor = vec3(0.004, 0.026, 0.06);
-    vec3 up = seaColor * (skyAmb + uSunE * max(L.y, 0.0)) / PI;
+    vec3 Ein = skyAmb + uSunE * max(L.y, 0.0);
+    vec3 up = seaColor * Ein / PI;
+    // Shallow water: light reaches a sandy bed and returns, attenuated per
+    // channel (red first), giving the turquoise of shallow bays.
+    vec3 sigmaW = vec3(0.42, 0.075, 0.045);
+    vec3 T2 = exp(-sigmaW * max(uDepth - vWorld.y, 0.3) * 2.2);
+    vec3 sand = vec3(0.62, 0.55, 0.40);
+    up = up * (1.0 - T2) + sand * Ein / PI * T2 * 0.9;
     float crest = clamp(vWorld.y / max(uHs * 0.5, 0.05), 0.0, 1.5);
     float back = pow(clamp(dot(L, -V), 0.0, 1.0), 4.0) * pow(clamp(0.5 - 0.5 * dot(L, N), 0.0, 1.0), 3.0);
     vec3 scatter = vec3(0.02, 0.16, 0.19) * uSunE * (crest * crest * back * 0.9 + 0.006 * pow(clamp(dot(V, N), 0.0, 1.0), 2.0) * crest);
@@ -970,7 +977,8 @@ void main() {
     vec3 V = normalize(uCamPos - vWorld);
     if (dot(N, V) < 0.0) N = -N;
     vec3 L = uSunDir;
-    float gloss = vColor.r + vColor.g + vColor.b < 0.25 ? 0.95 : 0.6;   // dark = glass
+    float sum = vColor.r + vColor.g + vColor.b;
+    float gloss = sum < 0.1 ? 0.97 : (sum < 0.25 ? 0.85 : 0.55);   // glass, gelcoat, paint
     // Sky irradiance from a heavily filtered lookup in the normal direction
     vec3 nUp = normalize(vec3(N.x, max(N.y, 0.05), N.z));
     vec3 skyIrr = skyLookup(nUp, 6.0) * PI * (0.6 + 0.4 * N.y);
@@ -1172,9 +1180,9 @@ function buildGrid(cols, rows) {
 }
 
 const QUALITY = {
-    low: { grid: [192, 160], scale: 0.75 },
-    medium: { grid: [320, 256], scale: 1.0 },
-    high: { grid: [448, 384], scale: 1.0 }
+    low: { grid: [192, 160], scale: 0.75, maxDpr: 1 },
+    medium: { grid: [320, 256], scale: 1.0, maxDpr: 1 },
+    high: { grid: [448, 384], scale: 1.0, maxDpr: 1.5 }
 };
 
 // =====================================================================
@@ -1185,31 +1193,40 @@ const BOAT = { length: 12, beam: 3.6, draft: 0.55 };
 function buildBoatMesh() {
     const pos = [], col = [], nrm = [], idx = [];
     const L = BOAT.length, B = BOAT.beam;
-    const white = [0.82, 0.83, 0.84], navy = [0.04, 0.07, 0.16], red = [0.32, 0.06, 0.05];
-    const teak = [0.42, 0.27, 0.15], glass = [0.02, 0.03, 0.04], grey = [0.55, 0.56, 0.58];
+    const white = [0.82, 0.83, 0.84], navy = [0.025, 0.045, 0.11], red = [0.32, 0.06, 0.05];
+    const teak = [0.42, 0.27, 0.15], glass = [0.02, 0.03, 0.04], grey = [0.55, 0.56, 0.58], deck = [0.66, 0.66, 0.63];
 
     function hullFrame(t) {
         const x = -L / 2 + t * L;
-        let hb = B / 2 * (0.9 + 0.1 * Math.min(1, t * 6));
-        if (t > 0.5) { const u = (t - 0.5) / 0.5; hb *= Math.sqrt(Math.max(0, 1 - u * u)); }
-        const sheer = 1.1 + 0.45 * Math.pow(t, 2.4);
-        const keel = 0.62 * (1 - 0.85 * Math.pow(Math.max(0, (t - 0.55) / 0.45), 1.6)) * (t < 0.06 ? 0.8 + t * 3 : 1);
-        return { x, hb, sheer, keel };
+        let hb = B / 2 * (0.93 + 0.07 * Math.min(1, t * 6));
+        if (t > 0.45) { const u = (t - 0.45) / 0.55; hb *= Math.pow(Math.max(0, 1 - u * u), 0.62); }
+        const sheer = 1.15 + 0.5 * Math.pow(t, 2.6);
+        const bow = Math.max(0, (t - 0.55) / 0.45);
+        const keel = 0.68 * (1 - 0.9 * Math.pow(bow, 1.5)) * (t < 0.05 ? 0.85 + t * 3 : 1);
+        const chine = 0.14 + 0.75 * Math.pow(bow, 2);
+        return { x, hb, sheer, keel, chine };
+    }
+    // Deep-V section: flared topsides down to a chine, then a straight V to the keel
+    function section(f, u) {           // u in [0,1]: deck edge -> keel
+        if (u < 0.42) {
+            const a = u / 0.42;
+            return [f.hb * (1 - 0.07 * a * a), f.sheer + (f.chine - f.sheer) * a];
+        }
+        const a = (u - 0.42) / 0.58;
+        return [f.hb * 0.93 * (1 - a), f.chine - (f.keel + f.chine) * a * (1.08 - 0.08 * a)];
     }
 
     // Hull skin: stations x ring (port deck edge -> keel -> starboard deck edge)
-    const S = 48, R = 20;
+    const S = 56, R = 24;
     const base = pos.length / 3;
     for (let i = 0; i <= S; i++) {
-        const t = i / S;
-        const f = hullFrame(t);
+        const f = hullFrame(i / S);
         for (let j = 0; j <= R; j++) {
-            const phi = j / R * Math.PI;
-            const cz = Math.cos(phi);
-            const z = f.hb * Math.sign(cz) * Math.pow(Math.abs(cz), 0.55);
-            const y = f.sheer - (f.sheer + f.keel) * Math.pow(Math.sin(phi), 1.8);
-            pos.push(f.x, y, z);
-            const c = y < 0.05 ? red : (y < 0.32 ? navy : white);
+            const side = j <= R / 2 ? 1 : -1;
+            const u = j <= R / 2 ? j / (R / 2) : (R - j) / (R / 2);
+            const [z, y] = section(f, u);
+            pos.push(f.x, y, side * z);
+            const c = y < 0.02 ? red : (y < 0.16 ? white : navy);
             col.push(...c);
         }
     }
@@ -1228,37 +1245,65 @@ function buildBoatMesh() {
     for (let i = 0; i <= S; i++) {
         const f = hullFrame(i / S);
         pos.push(f.x, f.sheer, f.hb, f.x, f.sheer, -f.hb);
-        col.push(...teak, ...teak);
+        col.push(...deck, ...deck);
     }
     for (let i = 0; i < S; i++) {
         const a = deckBase + i * 2;
         idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
     }
 
-    // Cabin: box with raked windshield and a dark window band
     function quad(p0, p1, p2, p3, c) {
-        const s = pos.length / 3;
+        const s0 = pos.length / 3;
         pos.push(...p0, ...p1, ...p2, ...p3);
         col.push(...c, ...c, ...c, ...c);
-        idx.push(s, s + 1, s + 2, s, s + 2, s + 3);
+        idx.push(s0, s0 + 1, s0 + 2, s0, s0 + 2, s0 + 3);
     }
-    const cx0 = -L * 0.2, cx1 = L * 0.12, cw = B * 0.36;
-    const fx = hullFrame(0.5);
-    const y0 = 1.15, y1 = 1.85, y2 = 2.25;
-    const rake = 0.9;
-    // sides (lower white, upper glass)
-    for (const s of [1, -1]) {
-        quad([cx0, y0, s * cw], [cx1, y0, s * cw], [cx1, y1, s * cw], [cx0, y1, s * cw], white);
-        quad([cx0, y1, s * cw], [cx1, y1, s * cw], [cx1 - rake * 0.4, y2, s * cw * 0.92], [cx0, y2, s * cw * 0.92], glass);
+    function poly(pts, c) {            // convex polygon as a fan
+        const s0 = pos.length / 3;
+        for (const p of pts) { pos.push(...p); col.push(...c); }
+        for (let i = 1; i < pts.length - 1; i++) idx.push(s0, s0 + i, s0 + i + 1);
     }
-    quad([cx1, y0, cw], [cx1, y0, -cw], [cx1, y1, -cw], [cx1, y1, cw], white);                      // front
-    quad([cx1, y1, cw], [cx1, y1, -cw], [cx1 - rake * 0.4, y2, -cw * 0.92], [cx1 - rake * 0.4, y2, cw * 0.92], glass); // windshield
-    quad([cx0, y0, -cw], [cx0, y0, cw], [cx0, y2, cw * 0.92], [cx0, y2, -cw * 0.92], white);        // back
-    quad([cx0, y2, cw * 0.92], [cx1 - rake * 0.4, y2, cw * 0.92], [cx1 - rake * 0.4, y2, -cw * 0.92], [cx0, y2, -cw * 0.92], white); // roof
-    // radar arch
-    quad([cx0 - 0.2, y2, 0.08], [cx0 + 0.15, y2, 0.08], [cx0 + 0.05, y2 + 0.5, 0.08], [cx0 - 0.1, y2 + 0.5, 0.08], grey);
-    quad([cx0 - 0.2, y2, -0.08], [cx0 + 0.15, y2, -0.08], [cx0 + 0.05, y2 + 0.5, -0.08], [cx0 - 0.1, y2 + 0.5, -0.08], grey);
-    void fx;
+
+    // Cabin: a swept side profile extruded across the beam, narrowing forward
+    const deckY = hullFrame(0.45).sheer;
+    const prof = [[-3.0, 0], [1.9, 0], [1.75, 0.42], [0.55, 0.98], [-2.55, 0.98], [-3.0, 0.9]];
+    const glassEdge = 2;                                   // edge 2 -> 3 is the windshield
+    const halfW = x => B * 0.34 * (1 - 0.28 * Math.max(0, (x + 0.5) / 2.4));
+    for (let k = 0; k < prof.length; k++) {
+        const [xa, ya] = prof[k], [xb, yb] = prof[(k + 1) % prof.length];
+        if (ya === 0 && yb === 0) continue;               // bottom sits on the deck
+        const c = k === glassEdge ? glass : white;
+        quad([xa, deckY + ya, halfW(xa)], [xb, deckY + yb, halfW(xb)], [xb, deckY + yb, -halfW(xb)], [xa, deckY + ya, -halfW(xa)], c);
+    }
+    for (const sd of [1, -1]) {
+        const pts = prof.map(([x, y]) => [x, deckY + y, sd * halfW(x)]);
+        poly(sd > 0 ? pts : pts.slice().reverse(), white);
+        // dark window band, slightly proud of the side
+        const wy0 = deckY + 0.5, wy1 = deckY + 0.86, wx0 = -2.5, wx1 = 1.0;
+        const z0 = sd * (halfW(wx0) + 0.01), z1 = sd * (halfW(wx1) + 0.01);
+        quad([wx0, wy0, z0], [wx1, wy0, z1], [wx1 - 0.25, wy1, z1], [wx0 + 0.1, wy1, z0], glass);
+    }
+    // Hardtop overhang and a short mast
+    quad([-3.15, deckY + 1.0, B * 0.36], [0.7, deckY + 1.0, B * 0.27], [0.7, deckY + 1.0, -B * 0.27], [-3.15, deckY + 1.0, -B * 0.36], white);
+    quad([-2.2, deckY + 1.0, 0.04], [-2.0, deckY + 1.0, 0.04], [-2.05, deckY + 1.75, 0.04], [-2.15, deckY + 1.75, 0.04], grey);
+    quad([-2.2, deckY + 1.0, -0.04], [-2.0, deckY + 1.0, -0.04], [-2.05, deckY + 1.75, -0.04], [-2.15, deckY + 1.75, -0.04], grey);
+
+    // Teak swim platform behind the transom
+    const tf = hullFrame(0);
+    const py = 0.32, pw = tf.hb * 0.92, px0 = tf.x - 0.75, px1 = tf.x + 0.02;
+    quad([px0, py, pw], [px1, py, pw], [px1, py, -pw], [px0, py, -pw], teak);
+    quad([px0, py - 0.08, pw], [px0, py, pw], [px0, py, -pw], [px0, py - 0.08, -pw], teak);
+
+    // Bow rails: thin bars along the foredeck edges, with stanchions
+    for (const sd of [1, -1]) {
+        for (let i = 32; i < S - 2; i++) {
+            const fa = hullFrame(i / S), fb = hullFrame((i + 1) / S);
+            const za = sd * (fa.hb - 0.1), zb = sd * (fb.hb - 0.1);
+            const ya = fa.sheer + 0.6, yb = fb.sheer + 0.6;
+            quad([fa.x, ya, za], [fb.x, yb, zb], [fb.x, yb + 0.04, zb], [fa.x, ya + 0.04, za], grey);
+            if (i % 6 === 2) quad([fa.x, fa.sheer, za], [fa.x + 0.05, fa.sheer, za], [fa.x + 0.05, ya, za], [fa.x, ya, za], grey);
+        }
+    }
 
     // Normals: area-weighted, smooth on the hull, flat elsewhere (unshared verts)
     const n = new Float32Array(pos.length);
@@ -1322,7 +1367,7 @@ function boatModel() {
 let targets = null;
 function resize(force) {
     const q = QUALITY[P.quality];
-    const dpr = Math.min(window.devicePixelRatio || 1, 2) * q.scale;
+    const dpr = Math.min(window.devicePixelRatio || 1, q.maxDpr) * q.scale;
     const w = Math.max(2, Math.floor(canvas.clientWidth * dpr));
     const h = Math.max(2, Math.floor(canvas.clientHeight * dpr));
     if (targets && !force && targets.w === w && targets.h === h) return;
@@ -1778,6 +1823,7 @@ function render() {
         gl.uniform1f(pr.u.uFoamOn, P.foam ? 1 : 0);
         gl.uniform1f(pr.u.uDebug, P.cascadeDebug ? 1 : 0);
         gl.uniform1f(pr.u.uHs, spectrumStats.hs);
+        gl.uniform1f(pr.u.uDepth, P.depth);
         cascades.forEach((c, i) => {
             bindTex(pr, 'uSlope' + i, c.slope);
             bindTex(pr, 'uFoam' + i, c.foam[c.foamIdx]);
