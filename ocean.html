@@ -821,6 +821,8 @@ uniform vec3 uBetaExt;
 uniform float uFilter, uFoamOn, uDebug, uHs, uDepth;
 uniform sampler2D uSlope0, uSlope1, uSlope2, uFoam0, uFoam1, uWakeSlope, uWakeFoam, uWakeHeight;
 uniform float uWakeViz;
+uniform sampler2D uRefl;
+uniform vec2 uRes;
 out vec4 o;
 
 float erfc_(float x) { return 2.0 * exp(-x * x) / (2.319 * x + sqrt(4.0 + 1.52 * x * x)); }
@@ -901,6 +903,11 @@ void main() {
     R.y = abs(R.y);
     float lod = clamp(log2(2.0 * sigma / (2.0 * PI / ${SKY_W}.0)), 0.0, 7.0);
     vec3 skyR = skyLookup(normalize(R), lod);
+    // Planar reflection of the boat, rippled by the filtered surface normal
+    float dCam = length(uCamPos - vWorld);
+    vec2 ruv = gl_FragCoord.xy / uRes + N.xz * 0.35 / (1.0 + dCam * 0.04);
+    vec4 refl = texture(uRefl, ruv);
+    skyR = mix(skyR, refl.rgb, refl.a * (1.0 - smoothstep(0.08, 0.3, sigma)));
 
     vec3 sun = uSunE * reflectedSun(L, V, N, Tx, Ty, var) + uMoonE * reflectedSun(uMoonDir, V, N, Tx, Ty, var);
 
@@ -1013,8 +1020,10 @@ void main() {
 const BOAT_FS = COMMON + SKY_COMMON + `
 in vec3 vWorld, vNormal, vColor;
 uniform vec3 uCamPos, uSunDir, uSunE, uBetaExt, uMoonDir, uMoonE;
+uniform float uClipY;          // reflection pass: drop what was under the water
 out vec4 o;
 void main() {
+    if (vWorld.y > uClipY) discard;
     vec3 N = normalize(vNormal);
     vec3 V = normalize(uCamPos - vWorld);
     if (dot(N, V) < 0.0) N = -N;
@@ -1387,7 +1396,7 @@ const boatMesh = buildBoatMesh();
 // Rigid-body state: kinematic in the plane, dynamic in heave / pitch / roll
 const boat = {
     x: 0, z: 0, heading: 0, speed: 0,
-    y: 0, vy: 0, pitch: 0, vp: 0, roll: 0, vr: 0,
+    y: 0, vy: 0, pitch: 0, vp: 0, roll: 0, vr: 0, waterY: 0,
     rudder: 0, throttle: 0
 };
 
@@ -1423,6 +1432,7 @@ function resize(force) {
         gl.deleteRenderbuffer(targets.msColor); gl.deleteRenderbuffer(targets.msDepth);
         gl.deleteFramebuffer(targets.msFBO); gl.deleteTexture(targets.hdr); gl.deleteFramebuffer(targets.hdrFBO);
         targets.bloom.forEach(b => { gl.deleteTexture(b.tex); gl.deleteFramebuffer(b.fbo); });
+        gl.deleteTexture(targets.refl); gl.deleteFramebuffer(targets.reflFBO); gl.deleteRenderbuffer(targets.reflDepth);
     }
     const samples = Math.min(4, gl.getParameter(gl.MAX_SAMPLES));
     const msColor = gl.createRenderbuffer();
@@ -1446,7 +1456,15 @@ function resize(force) {
         const tex = makeTex(bw, bh, { wrap: gl.CLAMP_TO_EDGE });
         bloom.push({ tex, fbo: makeFBO([tex]), w: bw, h: bh });
     }
-    targets = { w, h, msColor, msDepth, msFBO, hdr, hdrFBO, bloom };
+    // Half-resolution planar reflection target (boat mirrored in the sea)
+    const rw = Math.max(1, w >> 1), rh = Math.max(1, h >> 1);
+    const refl = makeTex(rw, rh, { wrap: gl.CLAMP_TO_EDGE });
+    const reflFBO = makeFBO([refl]);
+    const reflDepth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, reflDepth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, rw, rh);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, reflDepth);
+    targets = { w, h, msColor, msDepth, msFBO, hdr, hdrFBO, bloom, refl, reflFBO, reflDepth };
 }
 
 // =====================================================================
@@ -1813,7 +1831,8 @@ function updateBoat(dt) {
     if (!probeValid) return;
     const hb = probeOut[4], hs = probeOut[8], hp = probeOut[12], hsb = probeOut[16];
     const L = BOAT.length * 0.76, B = BOAT.beam * 0.84;
-    const yT = (hb + hs + hp + hsb) * 0.25 - BOAT.draft * 1.15 + boat.speed * 0.02;
+    boat.waterY = (hb + hs + hp + hsb) * 0.25;
+    const yT = boat.waterY - BOAT.draft * 1.15 + boat.speed * 0.02;
     const pT = Math.atan((hb - hs) / L) + boat.speed * 0.0035;     // slight planing bow-up trim
     const rT = -Math.atan((hp - hsb) / B) - boat.rudder * 0.05 * Math.min(1, boat.speed / 5);
     const spring = (x, v, t, w, z) => {
@@ -1829,6 +1848,23 @@ function updateBoat(dt) {
 // =====================================================================
 //  9. Frame rendering
 // =====================================================================
+function drawBoat(viewProj, model, clipY, betaExt) {
+    const pr = progs.boat;
+    gl.useProgram(pr.p);
+    gl.uniformMatrix4fv(pr.u.uViewProj, false, viewProj);
+    gl.uniformMatrix4fv(pr.u.uModel, false, model);
+    gl.uniform3fv(pr.u.uCamPos, cam.pos);
+    gl.uniform3fv(pr.u.uSunDir, sun.dir);
+    gl.uniform3fv(pr.u.uSunE, sun.E);
+    gl.uniform3fv(pr.u.uBetaExt, betaExt);
+    gl.uniform3fv(pr.u.uMoonDir, sun.moonDir);
+    gl.uniform3fv(pr.u.uMoonE, sun.moonE);
+    gl.uniform1f(pr.u.uClipY, clipY);
+    bindTex(pr, 'uSky', skyLut);
+    gl.bindVertexArray(boatMesh.vao);
+    gl.drawElements(gl.TRIANGLES, boatMesh.count, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+}
 function render() {
     resize();
     const W = targets.w, H = targets.h;
@@ -1845,6 +1881,19 @@ function render() {
 
     const haze = P.haze;
     const betaExt = [5.8e-6 + 2.3e-5 * haze, 13.5e-6 + 2.3e-5 * haze, 33.1e-6 + 2.3e-5 * haze];
+
+    // ---- Planar reflection of the boat about the local water level ----
+    gl.bindFramebuffer(gl.FRAMEBUFFER, targets.reflFBO);
+    gl.viewport(0, 0, targets.w >> 1, targets.h >> 1);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (P.boat) {
+        const y0 = boat.waterY;
+        const mirror = new Float32Array([1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 2 * y0, 0, 1]);
+        gl.enable(gl.DEPTH_TEST);
+        drawBoat(viewProj, M4.mul(mirror, boatModel()), y0, betaExt);
+        gl.disable(gl.DEPTH_TEST);
+    }
 
     // ---- Scene into multisampled HDR target ----
     gl.bindFramebuffer(gl.FRAMEBUFFER, targets.msFBO);
@@ -1868,21 +1917,7 @@ function render() {
     gl.enable(gl.DEPTH_TEST);
 
     // Boat
-    if (P.boat) {
-        pr = progs.boat;
-        gl.useProgram(pr.p);
-        gl.uniformMatrix4fv(pr.u.uViewProj, false, viewProj);
-        gl.uniformMatrix4fv(pr.u.uModel, false, boatModel());
-        gl.uniform3fv(pr.u.uCamPos, cam.pos);
-        gl.uniform3fv(pr.u.uSunDir, sun.dir);
-        gl.uniform3fv(pr.u.uSunE, sun.E);
-        gl.uniform3fv(pr.u.uBetaExt, betaExt);
-        gl.uniform3fv(pr.u.uMoonDir, sun.moonDir);
-        gl.uniform3fv(pr.u.uMoonE, sun.moonE);
-        bindTex(pr, 'uSky', skyLut);
-        gl.bindVertexArray(boatMesh.vao);
-        gl.drawElements(gl.TRIANGLES, boatMesh.count, gl.UNSIGNED_INT, 0);
-    }
+    if (P.boat) drawBoat(viewProj, boatModel(), 1e9, betaExt);
 
     // Ocean: projected grid limited to the visible part of the sea plane
     const hz = M4.transform(viewProj, [cam.pos[0] + Math.sin(cam.yaw) * 1e6, 0, cam.pos[2] + Math.cos(cam.yaw) * 1e6, 1]);
@@ -1919,6 +1954,8 @@ function render() {
         bindTex(pr, 'uWakeSlope', wake.slope);
         bindTex(pr, 'uWakeFoam', wake.foam[wake.foamIdx]);
         bindTex(pr, 'uWakeHeight', wake.disp);
+        bindTex(pr, 'uRefl', targets.refl);
+        gl.uniform2f(pr.u.uRes, W, H);
         gl.uniform1f(pr.u.uWakeViz, P.wakeView ? 1 : 0);
         bindTex(pr, 'uSky', skyLut);
         gl.bindVertexArray(grid.vao);
