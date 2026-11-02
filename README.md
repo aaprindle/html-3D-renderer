@@ -38,6 +38,12 @@ None of the physics below is scripted. It comes out of the solver:
 
 One practical finding: when the state goes through an FFT and back every frame, GPU `sin`/`cos` errors on the twiddle angles add up into faint ghost copies of the waves at N/4 offsets. A double-precision twiddle table, computed on the CPU, removes them.
 
+Turn on **Wake physics view** in the panel to check this yourself. A top-down camera shows the simulated cascade's height in false colour, with the theoretical Kelvin and asin(1/Fr) lines and the live depth and hull Froude numbers drawn over it.
+
+### Night
+
+The moon drives the same scattering model as the sun, and its sky pass is added into the sky lookup texture. Its glints go through the same filtered BRDF, and the tone mapper applies a scotopic Purkinje shift (after Kirk & O'Brien, SIGGRAPH 2011). In the *Moonlit plankton* preset, bioluminescent plankton glow wherever the dynamic cascade churns the water: stern wash, bow spray, steep wake slopes and stone ripples.
+
 ### Floating bodies
 
 The boat's heave, pitch and roll come from **asynchronous GPU probes** (read back through a pixel buffer and a fence). Choppy waves move water sideways, so each probe inverts the horizontal displacement by fixed-point iteration, x₀ ← x − D(x₀). It samples the cascades at the mip level that matches the hull's size, so the hull averages out ripples smaller than itself. Damped springs give it inertia.
