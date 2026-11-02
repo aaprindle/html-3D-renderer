@@ -8,6 +8,12 @@ A Canvas 2D gallery of animated shapes: a tesseract, a DNA helix, an icosahedron
 
 ## `ocean.html` — Spectral Ocean (WebGL2)
 
+| | |
+|---|---|
+| ![Golden hour](docs/golden-hour.jpg) | ![Wake physics view, supercritical shallow water](docs/wake-physics-view.jpg) |
+| ![Moonlit plankton](docs/moonlit-plankton.jpg) | ![Calm noon](docs/calm-noon.jpg) |
+| ![Storm, Beaufort 9](docs/storm.jpg) | ![Dusk with boat reflection](docs/dusk.jpg) |
+
 A real-time ocean built from published graphics and oceanography research. It adds a dynamic wave solver for boat wakes and splashes.
 
 | Part | Technique | Source |
