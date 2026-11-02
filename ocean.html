@@ -154,7 +154,7 @@ const P = {
     wind: 8, fetch: 120, swell: 0.35, depth: 200, windDir: 205, chop: 1.0, timeScale: 1,
     sunEl: 7, sunAz: 180, haze: 1.0, exposure: 0.0,
     boat: true, boatSpeed: 7, boatTurn: 2.5, chase: true,
-    filter: 'bruneton', foam: true, bloom: true, quality: 'high', cascadeDebug: false
+    filter: 'bruneton', foam: true, bloom: true, quality: 'high', cascadeDebug: false, bio: true
 };
 
 // ---------------------------------------------------------------------
@@ -710,9 +710,14 @@ void main() {
 const SKY_FS = COMMON + SKY_COMMON + `
 in vec2 vUv;
 uniform mat4 uInvViewProj;
-uniform vec3 uSunDir, uSunDisk;
+uniform vec3 uSunDir, uSunDisk, uMoonDir, uMoonDisk;
 uniform float uSunCos;
 out vec4 o;
+vec3 hash3(vec3 p) {
+    p = fract(p * vec3(443.897, 441.423, 437.195));
+    p += dot(p, p.yxz + 19.19);
+    return fract((p.xxy + p.yxx) * p.zyx);
+}
 void main() {
     vec4 a = uInvViewProj * vec4(vUv * 2.0 - 1.0, -1.0, 1.0);
     vec4 b = uInvViewProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
@@ -723,6 +728,21 @@ void main() {
     if (mu > uSunCos && d.y > -0.01) {
         float r = sqrt(max(0.0, 1.0 - (1.0 - mu) / (1.0 - uSunCos)));
         c += uSunDisk * (0.4 + 0.6 * r);    // limb darkening
+    }
+    float mm = dot(d, uMoonDir);
+    if (mm > 0.99997 && d.y > -0.01) {
+        vec3 q = normalize(d - uMoonDir * mm);
+        float maria = 0.8 + 0.2 * sin(q.x * 9000.0 + q.y * 7000.0) * sin(q.z * 8000.0);
+        c += uMoonDisk * maria;
+    }
+    // Stars: fixed radiance, so exposure alone decides when they show
+    if (d.y > 0.0) {
+        vec3 p = d * 260.0;
+        vec3 cell = floor(p);
+        vec3 h = hash3(cell);
+        vec3 sp = cell + 0.25 + 0.5 * h;
+        float star = smoothstep(0.1, 0.0, length(p - sp)) * step(0.982, h.x);
+        c += star * mix(vec3(0.8, 0.85, 1.0), vec3(1.0, 0.85, 0.7), h.y) * 0.03 * (0.05 + pow(h.z, 3.0)) * smoothstep(0.0, 0.2, d.y);
     }
     o = vec4(c, 1.0);
 }`;
@@ -793,7 +813,8 @@ void main() {
 const OCEAN_FS = COMMON + SKY_COMMON + WIND_CHUNK + `
 in vec3 vWorld;
 in vec2 vXZ;
-uniform vec3 uCamPos, uSunDir, uSunE;
+uniform vec3 uCamPos, uSunDir, uSunE, uMoonDir, uMoonE;
+uniform float uBio;
 uniform vec2 uUnresolved;
 uniform vec3 uBetaExt;
 uniform float uFilter, uFoamOn, uDebug, uHs, uDepth;
@@ -879,7 +900,7 @@ void main() {
     float lod = clamp(log2(2.0 * sigma / (2.0 * PI / ${SKY_W}.0)), 0.0, 7.0);
     vec3 skyR = skyLookup(normalize(R), lod);
 
-    vec3 sun = uSunE * reflectedSun(L, V, N, Tx, Ty, var);
+    vec3 sun = uSunE * reflectedSun(L, V, N, Tx, Ty, var) + uMoonE * reflectedSun(uMoonDir, V, N, Tx, Ty, var);
 
     // Light from below the surface + forward scattering through thin crests
     vec3 skyAmb = textureLod(uSky, vec2(0.5, 0.85), 9.0).rgb * PI;
@@ -921,6 +942,15 @@ void main() {
 
         vec3 foamC = vec3(0.8) * (0.85 + 0.3 * (n - 0.5)) * (uSunE * max(dot(N, L), 0.0) + skyAmb) / PI;
         col = mix(col, foamC, cov);
+
+        // Bioluminescence: dinoflagellates flash where the water is churned
+        // (wake breaking, stern wash, steep wake slopes, breaking crests)
+        if (uBio > 0.0) {
+            float stir = wakeFoam.g * 1.6 + wakeFoam.r * 0.7 + (f0.g + f1.g) * 0.25;
+            stir += clamp(length(mean - (s0.xy + s1.xy + s2.xy)) * 6.0 - 0.15, 0.0, 1.0) * wm;
+            float sparkle = mix(1.0, 0.5 + fbm(vXZ * 4.0 + uHs) * 1.2, detail);
+            col += vec3(0.05, 0.75, 1.0) * 0.009 * stir * sparkle * uBio;
+        }
     }
 
     if (uDebug > 0.5) {
@@ -970,7 +1000,7 @@ void main() {
 
 const BOAT_FS = COMMON + SKY_COMMON + `
 in vec3 vWorld, vNormal, vColor;
-uniform vec3 uCamPos, uSunDir, uSunE, uBetaExt;
+uniform vec3 uCamPos, uSunDir, uSunE, uBetaExt, uMoonDir, uMoonE;
 out vec4 o;
 void main() {
     vec3 N = normalize(vNormal);
@@ -982,8 +1012,8 @@ void main() {
     // Sky irradiance from a heavily filtered lookup in the normal direction
     vec3 nUp = normalize(vec3(N.x, max(N.y, 0.05), N.z));
     vec3 skyIrr = skyLookup(nUp, 6.0) * PI * (0.6 + 0.4 * N.y);
-    vec3 seaBounce = vec3(0.02, 0.04, 0.06) * max(-N.y, 0.0);
-    vec3 diff = vColor * (uSunE * max(dot(N, L), 0.0) + skyIrr + seaBounce * 20.0) / PI;
+    vec3 seaBounce = vec3(0.001, 0.002, 0.003) * max(-N.y, 0.0);
+    vec3 diff = vColor * (uSunE * max(dot(N, L), 0.0) + uMoonE * max(dot(N, uMoonDir), 0.0) + skyIrr + seaBounce * 20.0 * (uSunE.g + uMoonE.g)) / PI;
     vec3 H = normalize(L + V);
     float shin = mix(40.0, 900.0, gloss);
     float F = 0.04 + 0.96 * pow(1.0 - max(dot(V, N), 0.0), 5.0);
@@ -1035,7 +1065,7 @@ void main() {
 const COMPOSITE_FS = COMMON + `
 in vec2 vUv;
 uniform sampler2D uHdr, uBloom;
-uniform float uExposure, uBloomOn;
+uniform float uExposure, uBloomOn, uNight;
 out vec4 o;
 vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
 vec3 toSRGB(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
@@ -1043,6 +1073,10 @@ void main() {
     vec3 c = texture(uHdr, vUv).rgb;
     if (uBloomOn > 0.5) c = mix(c, texture(uBloom, vUv).rgb, 0.05);
     c *= uExposure;
+    // Scotopic (rod) vision at night: colour fades and shifts toward blue
+    // (Purkinje shift; after Kirk & O'Brien, SIGGRAPH 2011)
+    float rod = dot(c, vec3(0.03, 0.42, 0.55));
+    c = mix(c, rod * vec3(0.62, 0.78, 1.15), uNight * 0.55);
     c = aces(c);
     vec2 q = vUv - 0.5;
     c *= 1.0 - dot(q, q) * 0.35;
@@ -1504,16 +1538,15 @@ function updateCamera(dt) {
 // =====================================================================
 //  7. Sun & atmosphere (CPU side for sun colour)
 // =====================================================================
-const sun = { dir: [0, 1, 0], E: [1, 1, 1], disk: [1, 1, 1], dirty: true };
+const sun = { dir: [0, 1, 0], E: [1, 1, 1], disk: [1, 1, 1], moonDir: [0, 1, 0], moonE: [0, 0, 0], moonDisk: [0, 0, 0], night: 0, dirty: true };
 const SUN_I = 22;
-function updateSun() {
-    const el = P.sunEl * Math.PI / 180, az = P.sunAz * Math.PI / 180;
-    sun.dir = [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)];
+const MOON_F = 1.6e-3;      // moonlight relative to sunlight (compressed for half-float HDR)
 
-    // Transmittance from the sea surface toward the sun (same model as the LUT)
+// Transmittance from the sea surface along a direction (same model as the LUT)
+function transmittance(rd) {
     const Rg = 6360e3, Rt = 6420e3, bR = [5.802e-6, 13.558e-6, 33.1e-6], bMe = 21e-6 * P.haze / 0.9;
     const bO = [0.650e-6, 1.881e-6, 0.085e-6];
-    const ro = [0, Rg + 30, 0], rd = sun.dir;
+    const ro = [0, Rg + 30, 0];
     const b = ro[1] * rd[1], c = ro[1] * ro[1] - Rt * Rt;
     const tmax = -b + Math.sqrt(b * b - c);
     let odR = 0, odM = 0, odO = 0;
@@ -1526,19 +1559,43 @@ function updateSun() {
         odM += Math.exp(-h / 1200) * ds;
         odO += Math.max(0, 1 - Math.abs(h - 25e3) / 15e3) * ds;
     }
-    const horizonFade = Math.min(1, Math.max(0, (P.sunEl + 2.5) / 3));
-    sun.E = bR.map((br, i) => SUN_I * Math.exp(-(br * odR + bMe * odM + bO[i] * odO)) * horizonFade);
+    return bR.map((br, i) => Math.exp(-(br * odR + bMe * odM + bO[i] * odO)));
+}
+
+function dirFromAngles(elDeg, azDeg) {
+    const el = elDeg * Math.PI / 180, az = azDeg * Math.PI / 180;
+    return [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)];
+}
+
+function updateSun() {
+    sun.dir = dirFromAngles(P.sunEl, P.sunAz);
+    const fade = Math.min(1, Math.max(0, (P.sunEl + 2.5) / 3));
+    sun.E = transmittance(sun.dir).map(t => SUN_I * t * fade);
     sun.disk = sun.E.map(e => Math.min(e * 30, 600));
+
+    // A full moon opposite the sun, a little above the horizon
+    const moonEl = 14 + Math.max(0, -P.sunEl) * 1.5;
+    sun.moonDir = dirFromAngles(moonEl, P.sunAz + 165);
+    sun.moonE = transmittance(sun.moonDir).map((t, i) => SUN_I * MOON_F * t * [1.0, 0.96, 0.88][i]);
+    sun.moonDisk = sun.moonE.map(e => e * 40);
+    sun.night = Math.min(1, Math.max(0, (2 - P.sunEl) / 6));
     sun.dirty = true;
 }
 
 function renderSkyLut() {
     const pr = progs.skyLut;
     gl.useProgram(pr.p);
-    gl.uniform3fv(pr.u.uSunDir, sun.dir);
     gl.uniform1f(pr.u.uHaze, P.haze);
+    gl.uniform3fv(pr.u.uSunDir, sun.dir);
     gl.uniform1f(pr.u.uSunI, SUN_I);
     drawFullscreen(skyFBO);
+    // Moonlit sky: the same scattering, lit by the moon, added on top
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.uniform3fv(pr.u.uSunDir, sun.moonDir);
+    gl.uniform1f(pr.u.uSunI, SUN_I * MOON_F);
+    drawFullscreen(skyFBO);
+    gl.disable(gl.BLEND);
     mipmap(skyLut);
     sun.dirty = false;
 }
@@ -1734,7 +1791,7 @@ function updateBoat(dt) {
     const hb = probeOut[4], hs = probeOut[8], hp = probeOut[12], hsb = probeOut[16];
     const L = BOAT.length * 0.76, B = BOAT.beam * 0.84;
     const yT = (hb + hs + hp + hsb) * 0.25 - BOAT.draft * 1.15 + boat.speed * 0.02;
-    const pT = Math.atan((hb - hs) / L) + boat.speed * 0.008;      // slight planing bow-up trim
+    const pT = Math.atan((hb - hs) / L) + boat.speed * 0.0035;     // slight planing bow-up trim
     const rT = -Math.atan((hp - hsb) / B) - boat.rudder * 0.05 * Math.min(1, boat.speed / 5);
     const spring = (x, v, t, w, z) => {
         const a = w * w * (t - x) - 2 * z * w * v;
@@ -1780,6 +1837,8 @@ function render() {
     gl.uniform3fv(pr.u.uSunDir, sun.dir);
     gl.uniform3fv(pr.u.uSunDisk, sun.disk);
     gl.uniform1f(pr.u.uSunCos, Math.cos(0.75 * Math.PI / 180));
+    gl.uniform3fv(pr.u.uMoonDir, sun.moonDir);
+    gl.uniform3fv(pr.u.uMoonDisk, sun.moonDisk);
     gl.bindVertexArray(emptyVAO);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -1795,6 +1854,8 @@ function render() {
         gl.uniform3fv(pr.u.uSunDir, sun.dir);
         gl.uniform3fv(pr.u.uSunE, sun.E);
         gl.uniform3fv(pr.u.uBetaExt, betaExt);
+        gl.uniform3fv(pr.u.uMoonDir, sun.moonDir);
+        gl.uniform3fv(pr.u.uMoonE, sun.moonE);
         bindTex(pr, 'uSky', skyLut);
         gl.bindVertexArray(boatMesh.vao);
         gl.drawElements(gl.TRIANGLES, boatMesh.count, gl.UNSIGNED_INT, 0);
@@ -1824,6 +1885,9 @@ function render() {
         gl.uniform1f(pr.u.uDebug, P.cascadeDebug ? 1 : 0);
         gl.uniform1f(pr.u.uHs, spectrumStats.hs);
         gl.uniform1f(pr.u.uDepth, P.depth);
+        gl.uniform3fv(pr.u.uMoonDir, sun.moonDir);
+        gl.uniform3fv(pr.u.uMoonE, sun.moonE);
+        gl.uniform1f(pr.u.uBio, P.bio ? sun.night : 0);
         cascades.forEach((c, i) => {
             bindTex(pr, 'uSlope' + i, c.slope);
             bindTex(pr, 'uFoam' + i, c.foam[c.foamIdx]);
@@ -1872,7 +1936,9 @@ function render() {
     gl.useProgram(pr.p);
     bindTex(pr, 'uHdr', targets.hdr);
     bindTex(pr, 'uBloom', targets.bloom[0].tex);
-    gl.uniform1f(pr.u.uExposure, Math.pow(2, P.exposure) * 0.32);
+    // Eye adaptation: open up by ~7.5 stops as the sun sets
+    gl.uniform1f(pr.u.uExposure, Math.pow(2, P.exposure) * 0.32 * Math.pow(2, 7.5 * sun.night));
+    gl.uniform1f(pr.u.uNight, sun.night);
     gl.uniform1f(pr.u.uBloomOn, P.bloom ? 1 : 0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, W, H);
@@ -1898,7 +1964,7 @@ const UI = [
     { id: 'boatSpeed', label: 'Cruise speed', min: 0, max: 14, step: 0.1, unit: ' m/s' },
     { id: 'boatTurn', label: 'Autopilot turn rate', min: -10, max: 10, step: 0.1, unit: '°/s' },
     { section: 'Sky & light' },
-    { id: 'sunEl', label: 'Sun elevation', min: -2, max: 75, step: 0.1, unit: '°', sky: true },
+    { id: 'sunEl', label: 'Sun elevation', min: -8, max: 75, step: 0.1, unit: '°', sky: true },
     { id: 'sunAz', label: 'Sun azimuth', min: 0, max: 360, step: 1, unit: '°', sky: true },
     { id: 'haze', label: 'Haze (aerosols)', min: 0, max: 4, step: 0.01, sky: true },
     { id: 'exposure', label: 'Exposure', min: -3, max: 3, step: 0.05, unit: ' EV' },
@@ -1908,6 +1974,7 @@ const UI = [
     { id: 'quality', label: 'Quality', type: 'select', options: [['high', 'High'], ['medium', 'Medium'], ['low', 'Low']] },
     { id: 'foam', label: 'Whitecaps', type: 'check' },
     { id: 'bloom', label: 'Bloom', type: 'check' },
+    { id: 'bio', label: 'Bioluminescent plankton (night)', type: 'check' },
     { id: 'cascadeDebug', label: 'Tint cascades (R/G/B, wake = gold)', type: 'check' },
 ];
 
@@ -1916,7 +1983,8 @@ const PRESETS = {
     'Calm noon': { wind: 3.5, fetch: 40, swell: 0.6, depth: 200, chop: 0.8, sunEl: 55, sunAz: 150, haze: 0.6, exposure: -0.6, boatSpeed: 9, boatTurn: 0 },
     'Storm': { wind: 21, fetch: 500, swell: 0.1, depth: 300, chop: 1.3, sunEl: 18, sunAz: 120, haze: 3.2, exposure: 0.3, boatSpeed: 4, boatTurn: 1 },
     'Shallow bay': { wind: 5, fetch: 25, swell: 0.4, depth: 4, chop: 0.9, sunEl: 30, sunAz: 200, haze: 0.8, exposure: -0.3, boatSpeed: 6.5, boatTurn: 0 },
-    'Dusk': { wind: 6, fetch: 200, swell: 0.7, depth: 200, chop: 0.9, sunEl: 0.6, sunAz: 175, haze: 1.6, exposure: 1.2, boatSpeed: 5, boatTurn: 3 }
+    'Dusk': { wind: 6, fetch: 200, swell: 0.7, depth: 200, chop: 0.9, sunEl: 0.6, sunAz: 175, haze: 1.6, exposure: -0.4, boatSpeed: 5, boatTurn: 3 },
+    'Moonlit plankton': { wind: 4.5, fetch: 80, swell: 0.6, depth: 200, chop: 0.9, sunEl: -8, sunAz: 330, haze: 0.7, exposure: 0.3, boatSpeed: 7, boatTurn: 3 }
 };
 
 let spectrumDirty = true;
