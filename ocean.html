@@ -21,6 +21,7 @@
     .glass { background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
         backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
         box-shadow: 0 10px 40px rgba(0,0,0,0.35); }
+    body.clean .glass { display: none !important; }
 
     #panel { position: fixed; top: 16px; right: 16px; width: 300px; max-height: calc(100vh - 32px);
         overflow-y: auto; padding: 14px 16px 16px; font-size: 12.5px; z-index: 5; }
@@ -42,7 +43,7 @@
     button:hover { background: rgba(127, 227, 255, 0.22); }
     .btns { display: flex; flex-wrap: wrap; gap: 6px; }
 
-    #hud { position: fixed; left: 16px; top: 16px; padding: 12px 14px; font-size: 12px; z-index: 5; min-width: 230px; }
+    #hud { position: fixed; left: 16px; top: 16px; padding: 12px 14px; font-size: 12px; z-index: 5; min-width: 240px; }
     #hud .title { font-size: 16px; font-weight: 650; margin-bottom: 6px; }
     #hud .title a { color: var(--muted); font-size: 12px; font-weight: 400; margin-left: 8px; text-decoration: none; }
     #hud .grid { display: grid; grid-template-columns: auto auto; gap: 3px 14px; color: var(--muted); }
@@ -50,17 +51,18 @@
     #hint { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); padding: 8px 14px;
         font-size: 12px; color: var(--muted); z-index: 5; white-space: nowrap; }
 
-    #about { position: fixed; left: 16px; bottom: 16px; width: min(520px, calc(100vw - 32px)); max-height: 60vh;
+    #about { position: fixed; left: 16px; bottom: 16px; width: min(560px, calc(100vw - 32px)); max-height: 66vh;
         overflow-y: auto; padding: 16px 18px; font-size: 12.5px; line-height: 1.55; z-index: 6; display: none; }
     #about.open { display: block; }
     #about h3 { font-size: 14px; margin-bottom: 8px; }
     #about h4 { font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--accent); margin: 12px 0 4px; }
     #about p, #about li { color: #c4d4e4; }
     #about ul { padding-left: 18px; }
-    #about code { color: var(--accent); }
+    #about .new { border-left: 2px solid var(--accent); padding-left: 10px; }
 
-    #error { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center;
-        background: #05080d; color: #ffb4a8; font: 13px/1.5 ui-monospace, monospace; white-space: pre-wrap; z-index: 20; }
+    #error { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: left;
+        background: #05080d; color: #ffb4a8; font: 12px/1.45 ui-monospace, monospace; white-space: pre-wrap;
+        overflow: auto; z-index: 20; }
 
     @media (max-width: 700px) {
         #panel { width: calc(100vw - 32px); top: auto; bottom: 16px; max-height: 45vh; }
@@ -77,8 +79,9 @@
     <div class="grid">
         <span>Sea state</span><b id="hudSea">–</b>
         <span>Significant wave height</span><b id="hudHs">–</b>
-        <span>Peak period</span><b id="hudTp">–</b>
-        <span>Peak wavelength</span><b id="hudLp">–</b>
+        <span>Peak period · wavelength</span><b id="hudTp">–</b>
+        <span>Whitecap cover (Monahan)</span><b id="hudWc">–</b>
+        <span>Boat · depth Froude no.</span><b id="hudBoat">–</b>
         <span>Frame</span><b id="hudFps">–</b>
     </div>
 </div>
@@ -95,7 +98,7 @@
 </div>
 
 <div id="about" class="glass"></div>
-<div id="hint" class="glass">Drag to look · WASD / arrows to move · Q/E height · scroll to zoom</div>
+<div id="hint" class="glass">Drag to look · click the water to drop a stone · WASD/arrows move (or steer the boat) · Q/E height · H hides UI</div>
 <div id="error"></div>
 
 <script>
@@ -103,9 +106,16 @@
 
 // =====================================================================
 //  Spectral Ocean — WebGL2
-//  Tessendorf FFT ocean + Horvath directional spectrum + Bruneton
-//  slope-variance BRDF filtering + single-scattering atmosphere +
-//  Jacobian whitecaps + physically based bloom.
+//
+//  Wind sea:  Tessendorf FFT synthesis, 3 cascades, Horvath spectrum
+//  Shading:   Bruneton slope-variance BRDF, Cox–Munk sub-pixel slopes
+//  Foam:      Jacobian whitecaps calibrated to Monahan's coverage law
+//  Sky:       single-scattering Rayleigh + Mie + ozone
+//  New:       a *dynamic spectral cascade* — an exact-dispersion
+//             Fourier-space wave solver for wakes and splashes that
+//             shares the filtering / foam / depth pipeline of the
+//             synthesized sea; floating bodies via async GPU probes
+//             with displacement inversion and hull-scale filtering.
 // =====================================================================
 
 const canvas = document.getElementById('gl');
@@ -127,20 +137,24 @@ const maxAniso = anisoExt ? Math.min(16, gl.getParameter(anisoExt.MAX_TEXTURE_MA
 // ---------------------------------------------------------------------
 //  Constants
 // ---------------------------------------------------------------------
-const N = 256;                        // FFT resolution per cascade
+const N = 256;                        // FFT resolution (all cascades + wake)
 const LOG2N = 8;
 const G = 9.81;
 const CASCADES = [400, 61, 11];       // patch sizes (m), non-commensurate to hide tiling
+const WAKE_L = 256;                   // dynamic cascade: 256 m domain, 1 m cells
+const WAKE_CELL = WAKE_L / N;
 const SKY_W = 256, SKY_H = 128;
 const FAR = 30000;
+const PROBES = 8;
 
 // ---------------------------------------------------------------------
 //  Parameters (bound to UI)
 // ---------------------------------------------------------------------
 const P = {
-    wind: 9, fetch: 120, swell: 0.3, depth: 200, windDir: 205, chop: 1.0, timeScale: 1,
+    wind: 8, fetch: 120, swell: 0.35, depth: 200, windDir: 205, chop: 1.0, timeScale: 1,
     sunEl: 7, sunAz: 180, haze: 1.0, exposure: 0.0,
-    filter: 'bruneton', foam: true, bloom: true, quality: 'high', cascadeDebug: false, freeze: false
+    boat: true, boatSpeed: 7, boatTurn: 2.5, chase: true,
+    filter: 'bruneton', foam: true, bloom: true, quality: 'high', cascadeDebug: false
 };
 
 // ---------------------------------------------------------------------
@@ -163,22 +177,15 @@ function program(vsSrc, fsSrc) {
     gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
     gl.linkProgram(p);
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fail('Program link error:\n' + gl.getProgramInfoLog(p));
-    const u = {};
+    const u = {}, units = {};
     const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
-    for (let i = 0; i < n; i++) {
-        const info = gl.getActiveUniform(p, i);
-        u[info.name.replace(/\[0\]$/, '')] = gl.getUniformLocation(p, info.name);
-    }
-    // Assign texture units to samplers once, in declaration order.
-    const units = {};
-    let unit = 0;
     gl.useProgram(p);
+    let unit = 0;
     for (let i = 0; i < n; i++) {
         const info = gl.getActiveUniform(p, i);
-        if (info.type === gl.SAMPLER_2D) {
-            units[info.name] = unit;
-            gl.uniform1i(u[info.name], unit++);
-        }
+        const name = info.name.replace(/\[0\]$/, '');
+        u[name] = gl.getUniformLocation(p, info.name);
+        if (info.type === gl.SAMPLER_2D) { units[name] = unit; gl.uniform1i(u[name], unit++); }
     }
     return { p, u, units };
 }
@@ -190,8 +197,7 @@ function bindTex(prog, name, tex) {
     gl.bindTexture(gl.TEXTURE_2D, tex);
 }
 
-function makeTex(w, h, { internal = gl.RGBA16F, format = gl.RGBA, type = gl.HALF_FLOAT, filter = gl.LINEAR,
-    mip = false, wrap = gl.REPEAT, aniso = false } = {}) {
+function makeTex(w, h, { internal = gl.RGBA16F, filter = gl.LINEAR, mip = false, wrap = gl.REPEAT, aniso = false } = {}) {
     const t = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, t);
     const levels = mip ? Math.floor(Math.log2(Math.max(w, h))) + 1 : 1;
@@ -201,7 +207,7 @@ function makeTex(w, h, { internal = gl.RGBA16F, format = gl.RGBA, type = gl.HALF
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
     if (aniso && anisoExt) gl.texParameterf(gl.TEXTURE_2D, anisoExt.TEXTURE_MAX_ANISOTROPY_EXT, maxAniso);
-    t.w = w; t.h = h; t.format = format; t.type = type;
+    t.w = w; t.h = h;
     return t;
 }
 
@@ -222,6 +228,11 @@ function drawFullscreen(target) {
     if (target) gl.viewport(0, 0, target.w, target.h);
     gl.bindVertexArray(emptyVAO);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function mipmap(tex) {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.generateMipmap(gl.TEXTURE_2D);
 }
 
 // ---------------------------------------------------------------------
@@ -278,9 +289,8 @@ const M4 = {
 // =====================================================================
 //  1. Directional wave spectrum (CPU, regenerated when sea state changes)
 //     JONSWAP (Hasselmann 1973) + TMA shallow-water attenuation
-//     (Bouws 1985) + Donelan-Banner spreading with Horvath's swell
-//     elongation (Horvath 2015, "Empirical directional wave spectra
-//     for computer graphics").
+//     (Bouws 1985) + Donelan–Banner spreading with Horvath's swell
+//     elongation (Horvath 2015).
 // =====================================================================
 function mulberry32(a) {
     return function () {
@@ -309,7 +319,23 @@ function spreadingRaw(theta, beta, s) {
     return (1 / (c * c)) * Math.pow(Math.abs(Math.cos(theta / 2)), 2 * s);
 }
 
-const spectrumStats = { hs: 0, tp: 0, lp: 0, unresolved: [1e-3, 1e-3] };
+// Inverse standard normal CDF (Acklam's rational approximation)
+function probit(p) {
+    const a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357751867269, -30.66479806614716, 2.506628277459239];
+    const b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
+    const c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+    const d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
+    const q = Math.min(Math.max(p, 1e-9), 1 - 1e-9);
+    if (q < 0.02425) {
+        const r = Math.sqrt(-2 * Math.log(q));
+        return (((((c[0] * r + c[1]) * r + c[2]) * r + c[3]) * r + c[4]) * r + c[5]) / ((((d[0] * r + d[1]) * r + d[2]) * r + d[3]) * r + 1);
+    }
+    if (q > 1 - 0.02425) return -probit(1 - q);
+    const r = q - 0.5, t = r * r;
+    return (((((a[0] * t + a[1]) * t + a[2]) * t + a[3]) * t + a[4]) * t + a[5]) * r / (((((b[0] * t + b[1]) * t + b[2]) * t + b[3]) * t + b[4]) * t + 1);
+}
+
+const spectrumStats = { hs: 0, tp: 0, lp: 0, unresolved: [1e-3, 1e-3], sigmaJ: [0, 0, 0], whitecap: 0 };
 
 function buildSpectra() {
     const U = Math.max(P.wind, 0.5);
@@ -343,6 +369,7 @@ function buildSpectra() {
         const rng = mulberry32(9137 + c * 7919);
         const h0 = new Float32Array(N * N * 2);
         const kLo = bounds[c], kHi = bounds[c + 1];
+        let cascadeK2 = 0;
 
         for (let m = 0; m < N; m++) {
             for (let n = 0; n < N; n++) {
@@ -380,6 +407,7 @@ function buildSpectra() {
                 variance += e;
                 varU += kx * kx * e;
                 varC += kz * kz * e;
+                cascadeK2 += k * k * e;
             }
         }
 
@@ -394,6 +422,8 @@ function buildSpectra() {
             packed[i * 4 + 3] = -h0[j * 2 + 1];
         }
         out.push(packed);
+        // J - 1 ≈ -chop·|k|·h per mode, so its spread follows from the spectrum
+        spectrumStats.sigmaJ[c] = Math.sqrt(cascadeK2);
     }
 
     // Cox & Munk (1954) measured total slope variance; whatever the
@@ -403,6 +433,8 @@ function buildSpectra() {
     spectrumStats.hs = 4 * Math.sqrt(variance);
     spectrumStats.tp = 2 * Math.PI / wp;
     spectrumStats.lp = 2 * Math.PI * G / (wp * wp);
+    // Whitecap coverage law (Monahan & O'Muircheartaigh 1980)
+    spectrumStats.whitecap = Math.min(0.3, 3.84e-6 * Math.pow(U, 3.41));
     return out;
 }
 
@@ -424,40 +456,52 @@ precision highp sampler2D;
 const float PI = 3.14159265359;
 const int N = ${N};
 vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+vec2 cpack(vec2 a, vec2 b) { return vec2(a.x - b.y, a.y + b.x); } // a + i*b
+
+// Height spectrum h(k) -> the 8 spectra we need (displacement, slopes,
+// Jacobian terms), packed as 4 complex pairs of real fields.
+void derivSpectra(vec2 h, vec2 k, out vec4 o0, out vec4 o1) {
+    float kl = length(k);
+    vec2 ih = vec2(-h.y, h.x);
+    float ik = kl > 1e-6 ? 1.0 / kl : 0.0;
+    vec2 dx = ih * k.x * ik, dz = ih * k.y * ik;
+    vec2 dydx = ih * k.x, dydz = ih * k.y;
+    vec2 dxdx = -h * k.x * k.x * ik, dzdz = -h * k.y * k.y * ik, dxdz = -h * k.x * k.y * ik;
+    o0 = vec4(cpack(dx, h), cpack(dz, dydx));
+    o1 = vec4(cpack(dydz, dxdx), cpack(dzdz, dxdz));
+}
+vec2 waveNumber(ivec2 p, float L) {
+    return 2.0 * PI * vec2(p.x < N / 2 ? p.x : p.x - N, p.y < N / 2 ? p.y : p.y - N) / L;
+}
 `;
 
-// Time evolution of the spectrum and all derivative spectra (Tessendorf 2001)
+// ---- Wind sea: time evolution of the synthesized spectrum (Tessendorf 2001)
 const SPECTRUM_FS = COMMON + `
 uniform sampler2D uH0;
 uniform float uL, uTime, uDepth;
 layout(location = 0) out vec4 o0;
 layout(location = 1) out vec4 o1;
-vec2 pack(vec2 a, vec2 b) { return vec2(a.x - b.y, a.y + b.x); } // a + i*b
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
-    vec2 n = vec2(p.x < N / 2 ? p.x : p.x - N, p.y < N / 2 ? p.y : p.y - N);
-    vec2 k = 2.0 * PI * n / uL;
+    vec2 k = waveNumber(p, uL);
     float kl = length(k);
     vec4 h0 = texelFetch(uH0, p, 0);
     float w = sqrt(9.81 * kl * tanh(min(kl * uDepth, 20.0)));
     float ph = mod(w * uTime, 2.0 * PI);
     vec2 e = vec2(cos(ph), sin(ph));
     vec2 h = cmul(h0.xy, e) + cmul(h0.zw, vec2(e.x, -e.y));
-    vec2 ih = vec2(-h.y, h.x);
-    float ik = kl > 1e-6 ? 1.0 / kl : 0.0;
-    vec2 dx = ih * k.x * ik, dz = ih * k.y * ik;
-    vec2 dydx = ih * k.x, dydz = ih * k.y;
-    vec2 dxdx = -h * k.x * k.x * ik, dzdz = -h * k.y * k.y * ik, dxdz = -h * k.x * k.y * ik;
-    o0 = vec4(pack(dx, h), pack(dz, dydx));
-    o1 = vec4(pack(dydz, dxdx), pack(dzdz, dxdz));
+    derivSpectra(h, k, o0, o1);
 }`;
 
-// One radix-2 Stockham pass, applied to 4 complex fields at once
-const FFT_FS = COMMON + `
-uniform sampler2D uIn0, uIn1;
-uniform int uStage, uHoriz;
-layout(location = 0) out vec4 o0;
-layout(location = 1) out vec4 o1;
+// ---- One radix-2 Stockham pass over `count` RGBA textures (2 complex each)
+const fftShader = count => COMMON + `
+uniform int uStage, uStageIdx, uHoriz;
+uniform sampler2D uTwiddle;   // exact twiddles (double precision on the CPU)
+${[...Array(count)].map((_, i) => `uniform sampler2D uIn${i};\nlayout(location = ${i}) out vec4 o${i};`).join('\n')}
+vec4 butterfly(sampler2D t, ivec2 pe, ivec2 po, vec2 w) {
+    vec4 a = texelFetch(t, pe, 0), b = texelFetch(t, po, 0);
+    return vec4(a.xy + cmul(w, b.xy), a.zw + cmul(w, b.zw));
+}
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     int i = uHoriz == 1 ? p.x : p.y;
@@ -466,15 +510,11 @@ void main() {
     int o = e + N / 2;
     ivec2 pe = uHoriz == 1 ? ivec2(e, p.y) : ivec2(p.x, e);
     ivec2 po = uHoriz == 1 ? ivec2(o, p.y) : ivec2(p.x, o);
-    float t = 2.0 * PI * float(i) / float(uStage);
-    vec2 w = vec2(cos(t), sin(t));
-    vec4 a0 = texelFetch(uIn0, pe, 0), b0 = texelFetch(uIn0, po, 0);
-    vec4 a1 = texelFetch(uIn1, pe, 0), b1 = texelFetch(uIn1, po, 0);
-    o0 = vec4(a0.xy + cmul(w, b0.xy), a0.zw + cmul(w, b0.zw));
-    o1 = vec4(a1.xy + cmul(w, b1.xy), a1.zw + cmul(w, b1.zw));
+    vec2 w = texelFetch(uTwiddle, ivec2(i, uStageIdx), 0).xy;
+    ${[...Array(count)].map((_, i) => `o${i} = butterfly(uIn${i}, pe, po, w);`).join('\n    ')}
 }`;
 
-// Unpack the transformed fields into displacement + slope moments
+// ---- Unpack transformed fields into displacement + slope moments
 const ASSEMBLE_FS = COMMON + `
 uniform sampler2D uIn0, uIn1;
 uniform float uChop;
@@ -493,19 +533,111 @@ void main() {
     oSlope = vec4(dydx, dydz, dydx * dydx, dydz * dydz);
 }`;
 
-// Whitecap coverage: inject where the surface folds (Jacobian < threshold),
-// then let it decay (Dupuy & Bruneton 2012)
+// ---- Whitecaps: inject where the surface folds, then decay
+//      (Dupuy & Bruneton 2012). The threshold is set on the CPU so the
+//      injected fraction follows Monahan's coverage law. The wake variant
+//      also scrolls with its domain and adds turbulent stern foam.
 const FOAM_FS = COMMON + `
 uniform sampler2D uPrev, uDisp;
-uniform float uDt, uThreshold;
+uniform float uDt, uThreshold, uGain, uDecay, uCell, uBoatOn, uBoatSpeed;
+uniform ivec2 uShift;
+uniform vec2 uBoatPos, uBoatDir;
+uniform vec3 uBoatSize;
 out vec4 o;
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     float J = texelFetch(uDisp, p, 0).w;
-    float prev = texelFetch(uPrev, p, 0).r;
-    float inject = clamp((uThreshold - J) * 4.0, 0.0, 1.0);
-    float f = prev * exp(-uDt * 0.55) + inject * uDt * 4.0;
-    o = vec4(min(f, 1.6), inject, 0.0, 1.0);
+    float prev = texelFetch(uPrev, (p + uShift + ivec2(N * 8)) % N, 0).r;
+    float inject = clamp((uThreshold - J) * uGain, 0.0, 1.0);
+    if (uBoatOn > 0.5) {
+        vec2 x = (vec2(p) - float(N) * 0.5) * uCell - uBoatPos;
+        float a = dot(x, uBoatDir), c = dot(x, vec2(-uBoatDir.y, uBoatDir.x));
+        float L = uBoatSize.x, B = uBoatSize.y;
+        float speed = clamp(uBoatSpeed / 6.0, 0.0, 1.5);
+        // propeller wash behind the transom
+        float stern = exp(-pow((a + 0.5 * L) / (0.25 * L), 2.0) - pow(c / (0.28 * B), 2.0));
+        // bow spray sheets running along both sides of the hull
+        float side = exp(-pow((abs(c) - 0.5 * B) / (0.25 * B), 2.0)) * smoothstep(-0.2 * L, 0.35 * L, a) * (1.0 - smoothstep(0.35 * L, 0.55 * L, a));
+        inject = max(inject, clamp(stern * speed * 0.9 + side * speed * 0.45, 0.0, 1.0));
+    }
+    float f = prev * exp(-uDt * uDecay) + inject * uDt * 2.2;
+    o = vec4(min(f, 1.2), inject, 0.0, 1.0);
+}`;
+
+// ---- Dynamic spectral cascade, step 1 (real space): recentre the domain,
+//      absorb at the edges, and apply boat pressure + stone impulses.
+//      State is (h, phi): surface height and surface velocity potential.
+const WAKE_SOURCE_FS = COMMON + `
+uniform sampler2D uState;
+uniform ivec2 uShift;
+uniform float uDt, uCell, uBoatOn;
+uniform vec2 uBoatPos, uBoatDir;
+uniform vec3 uBoatSize;          // length, beam, draft
+uniform vec4 uSplash;            // x, z (domain-relative), radius, depth
+out vec4 o;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec2 s = texelFetch(uState, (p + uShift + ivec2(N * 8)) % N, 0).xy;
+    float h = s.x, phi = s.y;
+    vec2 x = (vec2(p) - float(N) * 0.5) * uCell;
+
+    // Absorbing sponge: waves leaving the window fade instead of wrapping
+    vec2 e = abs(vec2(p) - float(N) * 0.5) / (float(N) * 0.5);
+    float sponge = smoothstep(0.68, 0.98, max(e.x, e.y));
+    float damp = exp(-uDt * sponge * 2.5);
+    h *= damp; phi *= damp;
+
+    // Moving pressure patch: dphi/dt = -g h - p/rho, with p/rho = g * draft * footprint
+    vec2 r = x - uBoatPos;
+    float a = dot(r, uBoatDir), c = dot(r, vec2(-uBoatDir.y, uBoatDir.x));
+    float fp = exp(-2.8 * pow(a / (0.5 * uBoatSize.x), 2.0) - 2.8 * pow(c / (0.5 * uBoatSize.y), 2.0));
+    phi -= uDt * 9.81 * uBoatSize.z * fp * uBoatOn;
+
+    // Stone / click: initial depression (Cauchy-Poisson problem)
+    if (uSplash.w != 0.0) {
+        vec2 rs = x - uSplash.xy;
+        h -= uSplash.w * exp(-dot(rs, rs) / (uSplash.z * uSplash.z));
+    }
+    o = vec4(h, -phi, 0.0, 0.0);   // conjugated: the inverse kernel then gives a forward FFT
+}`;
+
+// ---- Dynamic spectral cascade, step 2 (Fourier space): every mode of the
+//      linearised free surface is a harmonic oscillator, advanced *exactly*
+//      by a rotation of angle omega(k)·dt with the same finite-depth
+//      dispersion as the wind sea. Also emits the derivative spectra.
+const WAKE_K_FS = COMMON + `
+uniform sampler2D uIn;
+uniform float uL, uDt, uDepth;
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+void main() {
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    ivec2 pm = ivec2((N - p.x) % N, (N - p.y) % N);
+    float norm = 1.0 / float(N * N);
+    vec2 Rk = texelFetch(uIn, p, 0).xy, Rm = texelFetch(uIn, pm, 0).xy;
+    vec2 Zk = vec2(Rk.x, -Rk.y) * norm;            // FFT of (h + i phi)
+    vec2 cZm = vec2(Rm.x, Rm.y) * norm;            // conj(Z(-k))
+    vec2 H = 0.5 * (Zk + cZm);
+    vec2 D = Zk - cZm;
+    vec2 Phi = 0.5 * vec2(D.y, -D.x);               // (Z - conj Z(-k)) / 2i
+
+    vec2 k = waveNumber(p, uL);
+    float kl = length(k);
+    float K = kl * tanh(min(kl * uDepth, 20.0));
+    float w = sqrt(9.81 * K);
+    float s = sqrt(K / 9.81);                       // K / omega
+    vec2 u = H, v = Phi * s;
+    float c = cos(w * uDt), sn = sin(w * uDt);
+    float damp = exp(-(0.015 + 0.004 * kl * kl) * uDt);   // weak viscous-like decay
+    vec2 u2 = (u * c + v * sn) * damp;
+    vec2 v2 = (-u * sn + v * c) * damp;
+    vec2 H2 = u2;
+    vec2 Phi2 = s > 1e-6 ? v2 / s : Phi;
+    if (p.x == N / 2 || p.y == N / 2) { H2 = vec2(0.0); Phi2 = vec2(0.0); }
+
+    derivSpectra(H2, k, o0, o1);
+    o2 = vec4(cpack(H2, Phi2), 0.0, 0.0);
 }`;
 
 // ---- Atmosphere --------------------------------------------------------
@@ -519,8 +651,9 @@ vec2 skyUV(vec3 d) {
 vec3 skyLookup(vec3 d, float lod) { return textureLod(uSky, skyUV(d), lod).rgb; }
 `;
 
-// Single-scattering Rayleigh + Mie (Nishita et al. 1993), stored in a
-// lat-long LUT with extra resolution at the horizon.
+// Single-scattering Rayleigh + Mie + ozone absorption (Nishita et al. 1993;
+// ozone layer as in Bruneton 2017 / Hillaire 2020), stored in a lat-long
+// LUT with extra resolution at the horizon.
 const SKY_LUT_FS = COMMON + `
 in vec2 vUv;
 uniform vec3 uSunDir;
@@ -528,7 +661,7 @@ uniform float uHaze, uSunI;
 out vec4 o;
 const float Rg = 6360e3, Rt = 6420e3;
 const vec3 bR = vec3(5.802e-6, 13.558e-6, 33.1e-6);
-const vec3 bO = vec3(0.650e-6, 1.881e-6, 0.085e-6);   // ozone absorption
+const vec3 bO = vec3(0.650e-6, 1.881e-6, 0.085e-6);
 float ozone(float h) { return max(0.0, 1.0 - abs(h - 25e3) / 15e3); }
 vec2 raySphere(vec3 ro, vec3 rd, float r) {
     float b = dot(ro, rd), c = dot(ro, ro) - r * r, d = b * b - c;
@@ -539,8 +672,7 @@ vec2 raySphere(vec3 ro, vec3 rd, float r) {
 void main() {
     float az = (vUv.x - 0.5) * 2.0 * PI;
     float t = (vUv.y - 0.5) * 2.0;
-    float e = sign(t) * t * t * 0.5 * PI;
-    e = max(e, 0.0005);
+    float e = max(sign(t) * t * t * 0.5 * PI, 0.0005);
     vec3 rd = vec3(cos(e) * sin(az), sin(e), cos(e) * cos(az));
 
     float bM = 21e-6 * uHaze, bMe = bM / 0.9;
@@ -585,8 +717,8 @@ void main() {
     vec4 a = uInvViewProj * vec4(vUv * 2.0 - 1.0, -1.0, 1.0);
     vec4 b = uInvViewProj * vec4(vUv * 2.0 - 1.0, 1.0, 1.0);
     vec3 d = normalize(b.xyz / b.w - a.xyz / a.w);
-    vec3 dd = normalize(vec3(d.x, max(d.y, 0.0), d.z));
-    vec3 c = skyLookup(dd, 0.0);
+    vec3 c = skyLookup(normalize(vec3(d.x, max(d.y, 0.0), d.z)), 0.0);
+    if (d.y < 0.0) c = mix(c, c * 0.25, smoothstep(0.0, -0.05, d.y));   // reads as distant water
     float mu = dot(d, uSunDir);
     if (mu > uSunCos && d.y > -0.01) {
         float r = sqrt(max(0.0, 1.0 - (1.0 - mu) / (1.0 - uSunCos)));
@@ -595,30 +727,48 @@ void main() {
     o = vec4(c, 1.0);
 }`;
 
-// ---- Ocean surface ------------------------------------------------------
-const OCEAN_VS = COMMON + `
+// ---- Shared displacement sampling (ocean vertices + probes) ------------
+const WIND_CHUNK = `
+uniform vec2 uWind;            // unit wind direction (world xz)
+uniform vec3 uL;               // cascade sizes
+uniform vec3 uWake;            // dynamic cascade: centre x, z and size
+uniform float uWakeOn;
+vec2 toWind(vec2 p) { return vec2(dot(p, uWind), dot(p, vec2(-uWind.y, uWind.x))); }
+vec2 fromWind(vec2 s) { return uWind * s.x + vec2(-uWind.y, uWind.x) * s.y; }
+vec2 wakeUV(vec2 xz) { return (xz - uWake.xy) / uWake.z + 0.5 + 0.5 / float(N); }
+float wakeMask(vec2 uv) { vec2 e = abs(uv - 0.5); return uWakeOn * (1.0 - smoothstep(0.30, 0.42, max(e.x, e.y))); }
+`;
+
+const DISP_CHUNK = WIND_CHUNK + `
+uniform sampler2D uDisp0, uDisp1, uDisp2, uWakeDisp;
+vec3 cascadeDisp(sampler2D t, vec2 w, float L, float footprint) {
+    float lod = log2(max(footprint / (L / float(N)), 1.0));
+    float fade = 1.0 - smoothstep(L * 0.03, L * 0.12, footprint);
+    vec3 d = textureLod(t, w / L, lod).xyz * fade;
+    vec2 h = fromWind(d.xz);
+    return vec3(h.x, d.y, h.y);
+}
+vec3 oceanDisp(vec2 xz, float footprint, float withWake) {
+    vec2 w = toWind(xz);
+    vec3 d = cascadeDisp(uDisp0, w, uL.x, footprint)
+           + cascadeDisp(uDisp1, w, uL.y, footprint)
+           + cascadeDisp(uDisp2, w, uL.z, footprint);
+    vec2 uv = wakeUV(xz);
+    float m = wakeMask(uv) * withWake;
+    if (m > 0.0) d += textureLod(uWakeDisp, uv, log2(max(footprint / (uWake.z / float(N)), 1.0))).xyz * m;
+    return d;
+}
+`;
+
+// ---- Ocean surface: projected grid (Johanson 2004) ----------------------
+const OCEAN_VS = COMMON + DISP_CHUNK + `
 in vec2 aGrid;
 uniform mat4 uViewProj, uInvViewProj;
 uniform vec3 uCamPos;
 uniform vec4 uNdc;             // xmin, xmax, ymin, ymax
-uniform vec2 uWind;            // unit wind direction (world xz)
-uniform vec3 uL;               // cascade sizes
 uniform float uVertexAngle, uFar;
-uniform sampler2D uDisp0, uDisp1, uDisp2;
 out vec3 vWorld;
 out vec2 vXZ;
-out float vDist;
-
-vec2 toWind(vec2 p) { return vec2(dot(p, uWind), dot(p, vec2(-uWind.y, uWind.x))); }
-vec2 fromWind(vec2 s) { return uWind * s.x + vec2(-uWind.y, uWind.x) * s.y; }
-
-vec3 sampleDisp(sampler2D t, vec2 w, float L, float footprint) {
-    float texel = L / float(N);
-    float lod = log2(max(footprint / texel, 1.0));
-    float fade = 1.0 - smoothstep(L * 0.03, L * 0.12, footprint);
-    vec3 d = textureLod(t, w / L, lod).xyz * fade;
-    return vec3(fromWind(d.xz).x, d.y, fromWind(d.xz).y);
-}
 
 void main() {
     vec2 ndc = mix(uNdc.xz, uNdc.yw, aGrid);
@@ -633,31 +783,22 @@ void main() {
         xz = uCamPos.xz + normalize(dir.xz + 1e-6) * uFar;
     }
     float dist = length(xz - uCamPos.xz);
-    float footprint = max(dist, 1.0) * uVertexAngle;
-    vec2 w = toWind(xz);
-    vec3 d = sampleDisp(uDisp0, w, uL.x, footprint)
-           + sampleDisp(uDisp1, w, uL.y, footprint)
-           + sampleDisp(uDisp2, w, uL.z, footprint);
+    vec3 d = oceanDisp(xz, max(dist, 1.0) * uVertexAngle, 1.0);
     d *= 1.0 - smoothstep(uFar * 0.5, uFar, dist);
     vWorld = vec3(xz.x, 0.0, xz.y) + d;
     vXZ = xz;
-    vDist = dist;
     gl_Position = uViewProj * vec4(vWorld, 1.0);
 }`;
 
-const OCEAN_FS = COMMON + SKY_COMMON + `
+const OCEAN_FS = COMMON + SKY_COMMON + WIND_CHUNK + `
 in vec3 vWorld;
 in vec2 vXZ;
-in float vDist;
 uniform vec3 uCamPos, uSunDir, uSunE;
-uniform vec2 uWind, uUnresolved;
-uniform vec3 uL, uBetaExt;
-uniform float uFilter, uFoamOn, uDebug, uHs, uTime;
-uniform sampler2D uSlope0, uSlope1, uSlope2, uFoam0, uFoam1, uFoam2;
+uniform vec2 uUnresolved;
+uniform vec3 uBetaExt;
+uniform float uFilter, uFoamOn, uDebug, uHs;
+uniform sampler2D uSlope0, uSlope1, uSlope2, uFoam0, uFoam1, uWakeSlope, uWakeFoam;
 out vec4 o;
-
-vec2 toWind(vec2 p) { return vec2(dot(p, uWind), dot(p, vec2(-uWind.y, uWind.x))); }
-vec2 fromWind(vec2 s) { return uWind * s.x + vec2(-uWind.y, uWind.x) * s.y; }
 
 float erfc_(float x) { return 2.0 * exp(-x * x) / (2.319 * x + sqrt(4.0 + 1.52 * x * x)); }
 float Lambda(float cosTheta, float sigmaSq) {
@@ -688,6 +829,11 @@ float vnoise(vec2 p) {
     f = f * f * (3.0 - 2.0 * f);
     return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
 }
+float fbm(vec2 p) {
+    float s = 0.0, a = 0.5;
+    for (int i = 0; i < 4; i++) { s += a * vnoise(p); p = p * 2.07 + vec2(1.7, 9.2); a *= 0.5; }
+    return s / 0.9375;
+}
 
 void main() {
     vec2 w = toWind(vXZ);
@@ -696,8 +842,22 @@ void main() {
     vec4 s2 = texture(uSlope2, w / uL.z);
     vec2 mean = s0.xy + s1.xy + s2.xy;
     vec2 var = max(s0.zw - s0.xy * s0.xy, 0.0) + max(s1.zw - s1.xy * s1.xy, 0.0) + max(s2.zw - s2.xy * s2.xy, 0.0);
-    // Naive mode: ignore what the mip-maps averaged away (classic aliasing/too-dark horizon)
-    var = (uFilter > 0.5 ? var : vec2(0.0)) + uUnresolved;
+
+    // Dynamic cascade (world-aligned) joins the same slope statistics
+    vec2 wuv = wakeUV(vXZ);
+    float wm = wakeMask(wuv);
+    vec2 wakeFoam = vec2(0.0);
+    if (wm > 0.0) {
+        vec4 sw = texture(uWakeSlope, wuv) * wm;
+        mean += toWind(sw.xy);
+        vec2 wv = max(sw.zw - sw.xy * sw.xy * wm, 0.0);
+        vec2 c2 = uWind * uWind;
+        var += vec2(c2.x * wv.x + c2.y * wv.y, c2.y * wv.x + c2.x * wv.y);
+        wakeFoam = texture(uWakeFoam, wuv).rg * wm;
+    }
+
+    // Naive mode: classic fixed roughness, ignoring sub-pixel slope statistics
+    var = uFilter > 0.5 ? var + uUnresolved : vec2(0.0015);
 
     vec2 sw = fromWind(mean);
     vec3 N = normalize(vec3(-sw.x, 1.0, -sw.y));
@@ -731,12 +891,28 @@ void main() {
 
     vec3 col = F * skyR + sun + (1.0 - F) * (up + scatter);
 
-    // Whitecaps
+    // Whitecaps: stage A (breaking now) and stage B (decaying streaks)
     if (uFoamOn > 0.5) {
-        float f = texture(uFoam0, w / uL.x).r + texture(uFoam1, w / uL.y).r * 0.9;
-        float n = vnoise(vXZ * 0.9 + uTime * 0.05) * 0.6 + vnoise(vXZ * 3.1) * 0.4;
-        float cov = smoothstep(n * 0.9, n * 0.9 + 0.35, f * 0.9);
-        vec3 foamC = vec3(0.85) * (uSunE * max(dot(N, L), 0.0) + skyAmb) / PI;
+        vec2 f0 = texture(uFoam0, w / uL.x).rg, f1 = texture(uFoam1, w / uL.y).rg * 0.7;
+        float breaking = f0.g + f1.g + wakeFoam.g;
+        float residual = f0.r + f1.r + wakeFoam.r * 0.75;
+
+        // Footprint-aware detail: patterns fade to their mean when sub-pixel
+        float footprint = length(fwidth(vXZ));
+        float detail = 1.0 - smoothstep(0.3, 1.5, footprint);
+        vec2 q = w * vec2(0.6, 1.0);   // streaks stretched along the wind
+        vec2 warp = vec2(fbm(q * 0.35), fbm(q * 0.35 + 5.2)) * 3.0;
+        float r1 = abs(fbm(q * 0.9 + warp) - 0.5) * 2.0;
+        float r2 = abs(fbm(q * 2.3 + warp * 1.7 + 3.3) - 0.5) * 2.0;
+        float lace = min(r1, r2 * 1.3);
+        float laceMask = mix(0.4, 1.0 - smoothstep(0.0, 0.1 + residual * 0.35, lace), detail);
+        float covRes = clamp(residual, 0.0, 1.0) * laceMask;
+
+        float n = mix(0.5, fbm(vXZ * 1.3), detail);
+        float covAct = smoothstep(0.3, 0.85, breaking * 1.3 + (n - 0.5) * 0.8);
+        float cov = max(covAct, covRes * 0.85);
+
+        vec3 foamC = vec3(0.8) * (0.85 + 0.3 * (n - 0.5)) * (uSunE * max(dot(N, L), 0.0) + skyAmb) / PI;
         col = mix(col, foamC, cov);
     }
 
@@ -744,6 +920,7 @@ void main() {
         col *= mix(vec3(1.0), vec3(1.0, 0.45, 0.4), clamp(dot(s0.zw, vec2(40.0)), 0.0, 1.0) * 0.6);
         col *= mix(vec3(1.0), vec3(0.4, 1.0, 0.5), clamp(dot(s1.zw, vec2(25.0)), 0.0, 1.0) * 0.6);
         col *= mix(vec3(1.0), vec3(0.45, 0.55, 1.0), clamp(dot(s2.zw, vec2(8.0)), 0.0, 1.0) * 0.6);
+        col = mix(col, col * vec3(1.6, 1.3, 0.4), wm * 0.5);
     }
 
     // Aerial perspective
@@ -752,6 +929,63 @@ void main() {
     vec3 vd = normalize(vWorld - uCamPos);
     vec3 fog = skyLookup(normalize(vec3(vd.x, 0.002, vd.z)), 1.0);
     o = vec4(col * T + fog * (1.0 - T), 1.0);
+}`;
+
+// ---- Probes: water height + slope at arbitrary world points -----------
+// Choppy waves move the surface sideways, so the water above point x came
+// from some x0 with x0 + D(x0) = x; a few fixed-point steps invert this.
+const PROBE_FS = COMMON + DISP_CHUNK + `
+uniform vec4 uProbe[${PROBES}];   // x, z, footprint (filter size), include wake
+out vec4 o;
+void main() {
+    vec4 pr = uProbe[int(gl_FragCoord.x)];
+    vec2 x0 = pr.xy;
+    for (int i = 0; i < 4; i++) x0 = pr.xy - oceanDisp(x0, pr.z, pr.w).xz;
+    float h = oceanDisp(x0, pr.z, pr.w).y;
+    o = vec4(h, x0 - pr.xy, 1.0);
+}`;
+
+// ---- Boat -------------------------------------------------------------
+const BOAT_VS = `#version 300 es
+precision highp float;
+in vec3 aPos;
+in vec3 aNormal;
+in vec3 aColor;
+uniform mat4 uViewProj, uModel;
+out vec3 vWorld, vNormal, vColor;
+void main() {
+    vec4 w = uModel * vec4(aPos, 1.0);
+    vWorld = w.xyz;
+    vNormal = mat3(uModel) * aNormal;
+    vColor = aColor;
+    gl_Position = uViewProj * w;
+}`;
+
+const BOAT_FS = COMMON + SKY_COMMON + `
+in vec3 vWorld, vNormal, vColor;
+uniform vec3 uCamPos, uSunDir, uSunE, uBetaExt;
+out vec4 o;
+void main() {
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(uCamPos - vWorld);
+    if (dot(N, V) < 0.0) N = -N;
+    vec3 L = uSunDir;
+    float gloss = vColor.r + vColor.g + vColor.b < 0.25 ? 0.95 : 0.6;   // dark = glass
+    // Sky irradiance from a heavily filtered lookup in the normal direction
+    vec3 nUp = normalize(vec3(N.x, max(N.y, 0.05), N.z));
+    vec3 skyIrr = skyLookup(nUp, 6.0) * PI * (0.6 + 0.4 * N.y);
+    vec3 seaBounce = vec3(0.02, 0.04, 0.06) * max(-N.y, 0.0);
+    vec3 diff = vColor * (uSunE * max(dot(N, L), 0.0) + skyIrr + seaBounce * 20.0) / PI;
+    vec3 H = normalize(L + V);
+    float shin = mix(40.0, 900.0, gloss);
+    float F = 0.04 + 0.96 * pow(1.0 - max(dot(V, N), 0.0), 5.0);
+    vec3 spec = uSunE * F * pow(max(dot(N, H), 0.0), shin) * (shin + 8.0) / (8.0 * PI) * max(dot(N, L), 0.0);
+    vec3 refl = skyLookup(normalize(reflect(-V, N) * vec3(1.0, 1.0, 1.0) + vec3(0.0, 0.02, 0.0)), mix(5.0, 1.0, gloss)) * F * gloss;
+    vec3 col = diff + spec + refl;
+    float d = length(uCamPos - vWorld);
+    vec3 T = exp(-uBetaExt * d);
+    vec3 vd = normalize(vWorld - uCamPos);
+    o = vec4(col * T + skyLookup(normalize(vec3(vd.x, 0.002, vd.z)), 1.0) * (1.0 - T), 1.0);
 }`;
 
 // ---- Post: bloom (Jimenez, "Next Generation Post Processing in Call of Duty", SIGGRAPH 2014) ----
@@ -814,25 +1048,52 @@ void main() {
 // =====================================================================
 const progs = {
     spectrum: program(FULLSCREEN_VS, SPECTRUM_FS),
-    fft: program(FULLSCREEN_VS, FFT_FS),
+    fft1: program(FULLSCREEN_VS, fftShader(1)),
+    fft2: program(FULLSCREEN_VS, fftShader(2)),
+    fft3: program(FULLSCREEN_VS, fftShader(3)),
     assemble: program(FULLSCREEN_VS, ASSEMBLE_FS),
     foam: program(FULLSCREEN_VS, FOAM_FS),
+    wakeSource: program(FULLSCREEN_VS, WAKE_SOURCE_FS),
+    wakeK: program(FULLSCREEN_VS, WAKE_K_FS),
     skyLut: program(FULLSCREEN_VS, SKY_LUT_FS),
     sky: program(FULLSCREEN_VS, SKY_FS),
     ocean: program(OCEAN_VS, OCEAN_FS),
+    probe: program(FULLSCREEN_VS, PROBE_FS),
+    boat: program(BOAT_VS, BOAT_FS),
     down: program(FULLSCREEN_VS, DOWN_FS),
     up: program(FULLSCREEN_VS, UP_FS),
     composite: program(FULLSCREEN_VS, COMPOSITE_FS)
 };
 
-const f32 = { internal: gl.RGBA32F, type: gl.FLOAT, filter: gl.NEAREST };
-const fftA = [makeTex(N, N, f32), makeTex(N, N, f32)];
-const fftB = [makeTex(N, N, f32), makeTex(N, N, f32)];
-const fboA = makeFBO(fftA), fboB = makeFBO(fftB);
+const f32 = { internal: gl.RGBA32F, filter: gl.NEAREST };
 
-const cascades = CASCADES.map(L => {
+// Twiddle table: GPU sin/cos on unreduced angles has structured error that a
+// solver which round-trips through the FFT every frame would accumulate into
+// ghost copies of the waves. Computed once here in double precision.
+const twiddleTex = makeTex(N, LOG2N, f32);
+{
+    const tw = new Float32Array(N * LOG2N * 4);
+    for (let s = 0; s < LOG2N; s++) {
+        const S = 2 << s;
+        for (let i = 0; i < N; i++) {
+            const a = 2 * Math.PI * (i % S) / S;
+            tw.set([Math.cos(a), Math.sin(a), 0, 0], (s * N + i) * 4);
+        }
+    }
+    gl.bindTexture(gl.TEXTURE_2D, twiddleTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N, LOG2N, gl.RGBA, gl.FLOAT, tw);
+}
+const fftA = [makeTex(N, N, f32), makeTex(N, N, f32), makeTex(N, N, f32)];
+const fftB = [makeTex(N, N, f32), makeTex(N, N, f32), makeTex(N, N, f32)];
+const bufA1 = { tex: [fftA[0]], fbo: makeFBO([fftA[0]]) };
+const bufB1 = { tex: [fftB[0]], fbo: makeFBO([fftB[0]]) };
+const bufA2 = { tex: fftA.slice(0, 2), fbo: makeFBO(fftA.slice(0, 2)) };
+const bufB2 = { tex: fftB.slice(0, 2), fbo: makeFBO(fftB.slice(0, 2)) };
+const bufA3 = { tex: fftA, fbo: makeFBO(fftA) };
+const bufB3 = { tex: fftB, fbo: makeFBO(fftB) };
+
+function makeLayer(L) {
     const c = { L };
-    c.h0 = makeTex(N, N, f32);
     c.disp = makeTex(N, N, { mip: true });
     c.slope = makeTex(N, N, { mip: true, aniso: true });
     c.foam = [makeTex(N, N, { mip: true, aniso: true }), makeTex(N, N, { mip: true, aniso: true })];
@@ -840,12 +1101,35 @@ const cascades = CASCADES.map(L => {
     c.foamFBO = [makeFBO([c.foam[0]]), makeFBO([c.foam[1]])];
     c.foamIdx = 0;
     return c;
+}
+const cascades = CASCADES.map(L => {
+    const c = makeLayer(L);
+    c.h0 = makeTex(N, N, f32);
+    return c;
 });
+const wake = makeLayer(WAKE_L);
+wake.source = makeTex(N, N, f32);
+wake.sourceFBO = makeFBO([wake.source]);
+for (const t of [...wake.foam, wake.disp, wake.slope]) {      // no wrap-around for the wake window
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
 
 const skyLut = makeTex(SKY_W, SKY_H, { mip: true, wrap: gl.CLAMP_TO_EDGE });
 gl.bindTexture(gl.TEXTURE_2D, skyLut);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
 const skyFBO = makeFBO([skyLut]);
+
+const probeTex = makeTex(PROBES, 1, f32);
+const probeFBO = makeFBO([probeTex]);
+const probePBO = gl.createBuffer();
+gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
+gl.bufferData(gl.PIXEL_PACK_BUFFER, PROBES * 16, gl.STREAM_READ);
+gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+const probeIn = new Float32Array(PROBES * 4);
+const probeOut = new Float32Array(PROBES * 4);
+let probeFence = null, probeValid = false;
 
 function uploadSpectra() {
     const data = buildSpectra();
@@ -893,14 +1177,155 @@ const QUALITY = {
     high: { grid: [448, 384], scale: 1.0 }
 };
 
-// ---- Render targets (resized with the window) ----
+// =====================================================================
+//  4. Boat: procedural hull, deck and cabin
+// =====================================================================
+const BOAT = { length: 12, beam: 3.6, draft: 0.55 };
+
+function buildBoatMesh() {
+    const pos = [], col = [], nrm = [], idx = [];
+    const L = BOAT.length, B = BOAT.beam;
+    const white = [0.82, 0.83, 0.84], navy = [0.04, 0.07, 0.16], red = [0.32, 0.06, 0.05];
+    const teak = [0.42, 0.27, 0.15], glass = [0.02, 0.03, 0.04], grey = [0.55, 0.56, 0.58];
+
+    function hullFrame(t) {
+        const x = -L / 2 + t * L;
+        let hb = B / 2 * (0.9 + 0.1 * Math.min(1, t * 6));
+        if (t > 0.5) { const u = (t - 0.5) / 0.5; hb *= Math.sqrt(Math.max(0, 1 - u * u)); }
+        const sheer = 1.1 + 0.45 * Math.pow(t, 2.4);
+        const keel = 0.62 * (1 - 0.85 * Math.pow(Math.max(0, (t - 0.55) / 0.45), 1.6)) * (t < 0.06 ? 0.8 + t * 3 : 1);
+        return { x, hb, sheer, keel };
+    }
+
+    // Hull skin: stations x ring (port deck edge -> keel -> starboard deck edge)
+    const S = 48, R = 20;
+    const base = pos.length / 3;
+    for (let i = 0; i <= S; i++) {
+        const t = i / S;
+        const f = hullFrame(t);
+        for (let j = 0; j <= R; j++) {
+            const phi = j / R * Math.PI;
+            const cz = Math.cos(phi);
+            const z = f.hb * Math.sign(cz) * Math.pow(Math.abs(cz), 0.55);
+            const y = f.sheer - (f.sheer + f.keel) * Math.pow(Math.sin(phi), 1.8);
+            pos.push(f.x, y, z);
+            const c = y < 0.05 ? red : (y < 0.32 ? navy : white);
+            col.push(...c);
+        }
+    }
+    for (let i = 0; i < S; i++) for (let j = 0; j < R; j++) {
+        const a = base + i * (R + 1) + j, b = a + R + 1;
+        idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+    // Transom (stern plate): fan from its centre
+    const tc = pos.length / 3;
+    const f0 = hullFrame(0);
+    pos.push(f0.x, (f0.sheer - f0.keel) * 0.5, 0); col.push(...white);
+    for (let j = 0; j < R; j++) idx.push(tc, base + j + 1, base + j);
+
+    // Deck: flat strip between the two deck edges at each station
+    const deckBase = pos.length / 3;
+    for (let i = 0; i <= S; i++) {
+        const f = hullFrame(i / S);
+        pos.push(f.x, f.sheer, f.hb, f.x, f.sheer, -f.hb);
+        col.push(...teak, ...teak);
+    }
+    for (let i = 0; i < S; i++) {
+        const a = deckBase + i * 2;
+        idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+    }
+
+    // Cabin: box with raked windshield and a dark window band
+    function quad(p0, p1, p2, p3, c) {
+        const s = pos.length / 3;
+        pos.push(...p0, ...p1, ...p2, ...p3);
+        col.push(...c, ...c, ...c, ...c);
+        idx.push(s, s + 1, s + 2, s, s + 2, s + 3);
+    }
+    const cx0 = -L * 0.2, cx1 = L * 0.12, cw = B * 0.36;
+    const fx = hullFrame(0.5);
+    const y0 = 1.15, y1 = 1.85, y2 = 2.25;
+    const rake = 0.9;
+    // sides (lower white, upper glass)
+    for (const s of [1, -1]) {
+        quad([cx0, y0, s * cw], [cx1, y0, s * cw], [cx1, y1, s * cw], [cx0, y1, s * cw], white);
+        quad([cx0, y1, s * cw], [cx1, y1, s * cw], [cx1 - rake * 0.4, y2, s * cw * 0.92], [cx0, y2, s * cw * 0.92], glass);
+    }
+    quad([cx1, y0, cw], [cx1, y0, -cw], [cx1, y1, -cw], [cx1, y1, cw], white);                      // front
+    quad([cx1, y1, cw], [cx1, y1, -cw], [cx1 - rake * 0.4, y2, -cw * 0.92], [cx1 - rake * 0.4, y2, cw * 0.92], glass); // windshield
+    quad([cx0, y0, -cw], [cx0, y0, cw], [cx0, y2, cw * 0.92], [cx0, y2, -cw * 0.92], white);        // back
+    quad([cx0, y2, cw * 0.92], [cx1 - rake * 0.4, y2, cw * 0.92], [cx1 - rake * 0.4, y2, -cw * 0.92], [cx0, y2, -cw * 0.92], white); // roof
+    // radar arch
+    quad([cx0 - 0.2, y2, 0.08], [cx0 + 0.15, y2, 0.08], [cx0 + 0.05, y2 + 0.5, 0.08], [cx0 - 0.1, y2 + 0.5, 0.08], grey);
+    quad([cx0 - 0.2, y2, -0.08], [cx0 + 0.15, y2, -0.08], [cx0 + 0.05, y2 + 0.5, -0.08], [cx0 - 0.1, y2 + 0.5, -0.08], grey);
+    void fx;
+
+    // Normals: area-weighted, smooth on the hull, flat elsewhere (unshared verts)
+    const n = new Float32Array(pos.length);
+    for (let i = 0; i < idx.length; i += 3) {
+        const a = idx[i] * 3, b = idx[i + 1] * 3, c = idx[i + 2] * 3;
+        const ux = pos[b] - pos[a], uy = pos[b + 1] - pos[a + 1], uz = pos[b + 2] - pos[a + 2];
+        const vx = pos[c] - pos[a], vy = pos[c + 1] - pos[a + 1], vz = pos[c + 2] - pos[a + 2];
+        const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        for (const v of [a, b, c]) { n[v] += nx; n[v + 1] += ny; n[v + 2] += nz; }
+    }
+    for (let i = 0; i < n.length; i += 3) {
+        const l = Math.hypot(n[i], n[i + 1], n[i + 2]) || 1;
+        nrm.push(n[i] / l, n[i + 1] / l, n[i + 2] / l);
+    }
+
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const attrs = [['aPos', pos], ['aNormal', nrm], ['aColor', col]];
+    for (const [name, data] of attrs) {
+        const b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+        const loc = gl.getAttribLocation(progs.boat.p, name);
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0);
+    }
+    const ib = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(idx), gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    return { vao, count: idx.length };
+}
+const boatMesh = buildBoatMesh();
+
+// Rigid-body state: kinematic in the plane, dynamic in heave / pitch / roll
+const boat = {
+    x: 0, z: 0, heading: 0, speed: 0,
+    y: 0, vy: 0, pitch: 0, vp: 0, roll: 0, vr: 0,
+    rudder: 0, throttle: 0
+};
+
+function boatAxes() {
+    const f = [Math.sin(boat.heading), 0, Math.cos(boat.heading)];
+    const s = [-Math.cos(boat.heading), 0, Math.sin(boat.heading)];   // local +z (port)
+    return { f, s };
+}
+
+function boatModel() {
+    const { f, s } = boatAxes();
+    const cp = Math.cos(boat.pitch), sp = Math.sin(boat.pitch), cr = Math.cos(boat.roll), sr = Math.sin(boat.roll);
+    // local rotation Rz(pitch) * Rx(roll), then into the world basis [f, up, s]
+    const lx = [cp, sp, 0], ly = [-sp * cr, cp * cr, sr], lz = [sp * sr, -cp * sr, cr];
+    const toW = v => [f[0] * v[0] + s[0] * v[2], v[1], f[2] * v[0] + s[2] * v[2]];
+    const X = toW(lx), Y = toW(ly), Z = toW(lz);
+    return new Float32Array([...X, 0, ...Y, 0, ...Z, 0, boat.x, boat.y, boat.z, 1]);
+}
+
+// =====================================================================
+//  5. Render targets (resized with the window)
+// =====================================================================
 let targets = null;
-function resize() {
+function resize(force) {
     const q = QUALITY[P.quality];
     const dpr = Math.min(window.devicePixelRatio || 1, 2) * q.scale;
     const w = Math.max(2, Math.floor(canvas.clientWidth * dpr));
     const h = Math.max(2, Math.floor(canvas.clientHeight * dpr));
-    if (targets && targets.w === w && targets.h === h) return;
+    if (targets && !force && targets.w === w && targets.h === h) return;
     canvas.width = w; canvas.height = h;
 
     if (targets) {
@@ -919,7 +1344,6 @@ function resize() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, msFBO);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, msColor);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, msDepth);
-    msFBO.w = w; msFBO.h = h;
 
     const hdr = makeTex(w, h, { wrap: gl.CLAMP_TO_EDGE });
     const hdrFBO = makeFBO([hdr]);
@@ -935,50 +1359,105 @@ function resize() {
 }
 
 // =====================================================================
-//  4. Camera & input
+//  6. Camera & input
 // =====================================================================
-const cam = { pos: [0, 9, 0], yaw: 0, pitch: -0.06, fov: 55 * Math.PI / 180, idle: 0 };
-cam.yaw = P.sunAz * Math.PI / 180 + 0.32;
+const cam = { pos: [0, 9, 0], yaw: 0, pitch: -0.06, fov: 55 * Math.PI / 180, idle: 0,
+    orbitYaw: 2.5, orbitPitch: 0.2, orbitDist: 34, alt: 9 };
 const keys = new Set();
-let dragging = false, lastX = 0, lastY = 0;
+let dragging = false, dragMoved = 0, lastX = 0, lastY = 0;
+let pendingSplash = null;
+let lastViewProj = null;
 
-canvas.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; canvas.setPointerCapture(e.pointerId); cam.idle = 0; });
+canvas.addEventListener('pointerdown', e => {
+    dragging = true; dragMoved = 0; lastX = e.clientX; lastY = e.clientY;
+    canvas.setPointerCapture(e.pointerId); cam.idle = 0;
+});
 canvas.addEventListener('pointermove', e => {
     if (!dragging) return;
-    cam.yaw -= (e.clientX - lastX) * 0.004;
-    cam.pitch = Math.max(-1.45, Math.min(1.2, cam.pitch - (e.clientY - lastY) * 0.004));
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    dragMoved += Math.abs(dx) + Math.abs(dy);
+    if (P.chase && P.boat) {
+        cam.orbitYaw -= dx * 0.005;
+        cam.orbitPitch = Math.max(0.02, Math.min(1.3, cam.orbitPitch + dy * 0.004));
+    } else {
+        cam.yaw -= dx * 0.004;
+        cam.pitch = Math.max(-1.45, Math.min(1.2, cam.pitch - dy * 0.004));
+    }
     lastX = e.clientX; lastY = e.clientY;
     cam.idle = 0;
 });
-canvas.addEventListener('pointerup', () => { dragging = false; });
+canvas.addEventListener('pointerup', e => {
+    dragging = false;
+    if (dragMoved < 4 && lastViewProj) {
+        // Click: drop a stone where the ray meets the sea
+        const r = canvas.getBoundingClientRect();
+        const nx = (e.clientX - r.left) / r.width * 2 - 1, ny = 1 - (e.clientY - r.top) / r.height * 2;
+        const inv = M4.invert(lastViewProj);
+        const a = M4.transform(inv, [nx, ny, -1, 1]), b = M4.transform(inv, [nx, ny, 1, 1]);
+        const pa = a.slice(0, 3).map(v => v / a[3]), pb = b.slice(0, 3).map(v => v / b[3]);
+        const d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        if (d[1] < 0) {
+            const t = -pa[1] / d[1];
+            pendingSplash = { x: pa[0] + d[0] * t, z: pa[2] + d[2] * t };
+        }
+    }
+});
 canvas.addEventListener('wheel', e => {
-    cam.fov = Math.max(12, Math.min(90, cam.fov * 180 / Math.PI * Math.exp(e.deltaY * 0.001))) * Math.PI / 180;
+    if (P.chase && P.boat) cam.orbitDist = Math.max(10, Math.min(150, cam.orbitDist * Math.exp(e.deltaY * 0.001)));
+    else cam.fov = Math.max(12, Math.min(90, cam.fov * 180 / Math.PI * Math.exp(e.deltaY * 0.001))) * Math.PI / 180;
     e.preventDefault();
 }, { passive: false });
-window.addEventListener('keydown', e => { if (e.target.tagName !== 'INPUT') { keys.add(e.code); cam.idle = 0; } });
+window.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    if (e.code === 'KeyH') document.body.classList.toggle('clean');
+    keys.add(e.code); cam.idle = 0;
+});
 window.addEventListener('keyup', e => keys.delete(e.code));
 
+function waterAtCamera() { return probeValid ? probeOut[0] : 0; }
+
 function updateCamera(dt) {
-    const speed = (4 + cam.pos[1] * 1.5) * (keys.has('ShiftLeft') ? 4 : 1);
+    const fwd = keys.has('KeyW') || keys.has('ArrowUp'), back = keys.has('KeyS') || keys.has('ArrowDown');
+    const left = keys.has('KeyA') || keys.has('ArrowLeft'), right = keys.has('KeyD') || keys.has('ArrowRight');
+    cam.idle += dt;
+
+    if (P.chase && P.boat) {
+        // Keys steer the boat; the camera orbits it
+        boat.throttle = fwd ? 1 : back ? -1 : 0;
+        boat.rudder = left ? 1 : right ? -1 : 0;
+        if (cam.idle > 6) cam.orbitYaw += dt * 0.04;
+        const yaw = boat.heading + cam.orbitYaw;
+        const cp = Math.cos(cam.orbitPitch);
+        const target = [boat.x, boat.y + 1.5, boat.z];
+        const eye = [target[0] + Math.sin(yaw) * cp * cam.orbitDist, target[1] + Math.sin(cam.orbitPitch) * cam.orbitDist,
+            target[2] + Math.cos(yaw) * cp * cam.orbitDist];
+        eye[1] = Math.max(eye[1], waterAtCamera() + 1.5);
+        cam.pos = eye;
+        const d = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
+        cam.yaw = Math.atan2(d[0], d[2]);
+        cam.pitch = Math.atan2(d[1], Math.hypot(d[0], d[2]));
+        return;
+    }
+    boat.throttle = 0; boat.rudder = 0;
+    const speed = (4 + cam.alt * 1.5) * (keys.has('ShiftLeft') ? 4 : 1);
     const fx = Math.sin(cam.yaw), fz = Math.cos(cam.yaw);
     let mx = 0, mz = 0, my = 0;
-    if (keys.has('KeyW') || keys.has('ArrowUp')) { mx += fx; mz += fz; }
-    if (keys.has('KeyS') || keys.has('ArrowDown')) { mx -= fx; mz -= fz; }
-    if (keys.has('KeyA') || keys.has('ArrowLeft')) { mx += fz; mz -= fx; }
-    if (keys.has('KeyD') || keys.has('ArrowRight')) { mx -= fz; mz += fx; }
+    if (fwd) { mx += fx; mz += fz; }
+    if (back) { mx -= fx; mz -= fz; }
+    if (left) { mx += fz; mz -= fx; }
+    if (right) { mx -= fz; mz += fx; }
     if (keys.has('KeyE')) my += 1;
     if (keys.has('KeyQ')) my -= 1;
     cam.pos[0] += mx * speed * dt;
     cam.pos[2] += mz * speed * dt;
-    cam.pos[1] = Math.max(1.2, Math.min(2000, cam.pos[1] * Math.exp(my * dt * 1.2)));
-
-    // Gentle cinematic drift while idle
-    cam.idle += dt;
+    cam.alt = Math.max(1.2, Math.min(2000, cam.alt * Math.exp(my * dt * 1.2)));
+    // Never let the camera end up under a passing crest
+    cam.pos[1] = Math.max(cam.alt, waterAtCamera() + 1.4);
     if (cam.idle > 6) cam.yaw += dt * 0.012;
 }
 
 // =====================================================================
-//  5. Sun & atmosphere (CPU side for sun colour)
+//  7. Sun & atmosphere (CPU side for sun colour)
 // =====================================================================
 const sun = { dir: [0, 1, 0], E: [1, 1, 1], disk: [1, 1, 1], dirty: true };
 const SUN_I = 22;
@@ -988,11 +1467,11 @@ function updateSun() {
 
     // Transmittance from the sea surface toward the sun (same model as the LUT)
     const Rg = 6360e3, Rt = 6420e3, bR = [5.802e-6, 13.558e-6, 33.1e-6], bMe = 21e-6 * P.haze / 0.9;
+    const bO = [0.650e-6, 1.881e-6, 0.085e-6];
     const ro = [0, Rg + 30, 0], rd = sun.dir;
     const b = ro[1] * rd[1], c = ro[1] * ro[1] - Rt * Rt;
     const tmax = -b + Math.sqrt(b * b - c);
     let odR = 0, odM = 0, odO = 0;
-    const bO = [0.650e-6, 1.881e-6, 0.085e-6];
     const S = 96, ds = tmax / S;
     for (let i = 0; i < S; i++) {
         const t = (i + 0.5) * ds;
@@ -1002,7 +1481,6 @@ function updateSun() {
         odM += Math.exp(-h / 1200) * ds;
         odO += Math.max(0, 1 - Math.abs(h - 25e3) / 15e3) * ds;
     }
-    // Soft fade as the sun sinks below the horizon
     const horizonFade = Math.min(1, Math.max(0, (P.sunEl + 2.5) / 3));
     sun.E = bR.map((br, i) => SUN_I * Math.exp(-(br * odR + bMe * odM + bO[i] * odO)) * horizonFade);
     sun.disk = sun.E.map(e => Math.min(e * 30, 600));
@@ -1016,68 +1494,217 @@ function renderSkyLut() {
     gl.uniform1f(pr.u.uHaze, P.haze);
     gl.uniform1f(pr.u.uSunI, SUN_I);
     drawFullscreen(skyFBO);
-    gl.bindTexture(gl.TEXTURE_2D, skyLut);
-    gl.generateMipmap(gl.TEXTURE_2D);
+    mipmap(skyLut);
     sun.dirty = false;
 }
 
 // =====================================================================
-//  6. Per-frame simulation
+//  8. Simulation
 // =====================================================================
+function runFFT(pr, srcTex, bufs) {
+    gl.useProgram(pr.p);
+    let src = srcTex;
+    let i = 0;
+    for (let dir = 1; dir >= 0; dir--) {
+        gl.uniform1i(pr.u.uHoriz, dir);
+        for (let s = 0; s < LOG2N; s++, i++) {
+            gl.uniform1i(pr.u.uStage, 2 << s);
+            gl.uniform1i(pr.u.uStageIdx, s);
+            bindTex(pr, 'uTwiddle', twiddleTex);
+            src.forEach((t, j) => bindTex(pr, 'uIn' + j, t));
+            const dst = bufs[i % 2];
+            drawFullscreen(dst.fbo);
+            src = dst.tex;
+        }
+    }
+    return src;
+}
+
+function assembleLayer(layer, src, chop, dt, foam) {
+    let pr = progs.assemble;
+    gl.useProgram(pr.p);
+    bindTex(pr, 'uIn0', src[0]);
+    bindTex(pr, 'uIn1', src[1]);
+    gl.uniform1f(pr.u.uChop, chop);
+    drawFullscreen(layer.assembleFBO);
+    mipmap(layer.disp);
+    mipmap(layer.slope);
+
+    pr = progs.foam;
+    gl.useProgram(pr.p);
+    bindTex(pr, 'uPrev', layer.foam[layer.foamIdx]);
+    bindTex(pr, 'uDisp', layer.disp);
+    gl.uniform1f(pr.u.uDt, dt);
+    gl.uniform1f(pr.u.uThreshold, foam.threshold);
+    gl.uniform1f(pr.u.uGain, foam.gain);
+    gl.uniform1f(pr.u.uDecay, foam.decay);
+    gl.uniform2i(pr.u.uShift, foam.shift ? foam.shift[0] : 0, foam.shift ? foam.shift[1] : 0);
+    gl.uniform1f(pr.u.uCell, WAKE_CELL);
+    gl.uniform1f(pr.u.uBoatOn, foam.boat ? 1 : 0);
+    if (foam.boat) {
+        gl.uniform2f(pr.u.uBoatPos, foam.boat.x, foam.boat.z);
+        gl.uniform2f(pr.u.uBoatDir, Math.sin(boat.heading), Math.cos(boat.heading));
+        gl.uniform3f(pr.u.uBoatSize, BOAT.length, BOAT.beam, BOAT.draft);
+        gl.uniform1f(pr.u.uBoatSpeed, boat.speed);
+    }
+    layer.foamIdx ^= 1;
+    drawFullscreen(layer.foamFBO[layer.foamIdx]);
+    mipmap(layer.foam[layer.foamIdx]);
+}
+
+// Dynamic cascade: window centre snaps to whole cells so the recentring
+// shift is an exact texel offset.
+const wakeState = { cx: 0, cz: 0, active: true };
+
+function simulateWake(dt) {
+    // Window sits behind the boat so most of it holds the trailing wake
+    const lead = 55;
+    const ncx = Math.round((boat.x - Math.sin(boat.heading) * lead) / WAKE_CELL) * WAKE_CELL;
+    const ncz = Math.round((boat.z - Math.cos(boat.heading) * lead) / WAKE_CELL) * WAKE_CELL;
+    const shift = [Math.round((ncx - wakeState.cx) / WAKE_CELL), Math.round((ncz - wakeState.cz) / WAKE_CELL)];
+    wakeState.cx = ncx; wakeState.cz = ncz;
+    const rel = { x: boat.x - ncx, z: boat.z - ncz };
+
+    // 1. real-space sources + sponge + recentring  (state lives in fftB[2])
+    let pr = progs.wakeSource;
+    gl.useProgram(pr.p);
+    bindTex(pr, 'uState', fftB[2]);
+    gl.uniform2i(pr.u.uShift, shift[0], shift[1]);
+    gl.uniform1f(pr.u.uDt, dt);
+    gl.uniform1f(pr.u.uCell, WAKE_CELL);
+    gl.uniform1f(pr.u.uBoatOn, P.boat ? Math.min(1, boat.speed / 0.5) : 0);
+    gl.uniform2f(pr.u.uBoatPos, rel.x, rel.z);
+    gl.uniform2f(pr.u.uBoatDir, Math.sin(boat.heading), Math.cos(boat.heading));
+    gl.uniform3f(pr.u.uBoatSize, BOAT.length, BOAT.beam, BOAT.draft);
+    if (pendingSplash) {
+        gl.uniform4f(pr.u.uSplash, pendingSplash.x - ncx, pendingSplash.z - ncz, 1.6, 1.2);
+        pendingSplash = null;
+    } else gl.uniform4f(pr.u.uSplash, 0, 0, 1, 0);
+    drawFullscreen(wake.sourceFBO);
+
+    // 2. forward FFT (via the inverse kernel on conjugated data)
+    const spec = runFFT(progs.fft1, [wake.source], [bufB1, bufA1]);
+
+    // 3. exact per-mode time stepping + derivative spectra
+    pr = progs.wakeK;
+    gl.useProgram(pr.p);
+    bindTex(pr, 'uIn', spec[0]);
+    gl.uniform1f(pr.u.uL, WAKE_L);
+    gl.uniform1f(pr.u.uDt, dt);
+    gl.uniform1f(pr.u.uDepth, P.depth);
+    drawFullscreen(bufB3.fbo);
+
+    // 4. back to real space: render fields + next state (ends in fftB)
+    const res = runFFT(progs.fft3, fftB, [bufA3, bufB3]);
+    assembleLayer(wake, res, 0.9, dt, { threshold: 0.55, gain: 4, decay: 0.2, shift, boat: P.boat ? rel : null });
+}
+
 function simulate(time, dt) {
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
-    for (const c of cascades) {
-        // Spectrum at time t
-        let pr = progs.spectrum;
+    simulateWake(dt);
+    for (let ci = 0; ci < cascades.length; ci++) {
+        const c = cascades[ci];
+        const pr = progs.spectrum;
         gl.useProgram(pr.p);
         bindTex(pr, 'uH0', c.h0);
         gl.uniform1f(pr.u.uL, c.L);
         gl.uniform1f(pr.u.uTime, time);
         gl.uniform1f(pr.u.uDepth, P.depth);
-        drawFullscreen(fboA);
-
-        // 2D inverse FFT: 8 horizontal + 8 vertical passes
-        pr = progs.fft;
-        gl.useProgram(pr.p);
-        let src = fftA, dst = fboB, other = fftB, otherFbo = fboA;
-        for (let dir = 1; dir >= 0; dir--) {
-            gl.uniform1i(pr.u.uHoriz, dir);
-            for (let s = 0; s < LOG2N; s++) {
-                gl.uniform1i(pr.u.uStage, 2 << s);
-                bindTex(pr, 'uIn0', src[0]);
-                bindTex(pr, 'uIn1', src[1]);
-                drawFullscreen(dst);
-                [src, other] = [other, src];
-                [dst, otherFbo] = [otherFbo, dst];
-            }
-        }
-
-        pr = progs.assemble;
-        gl.useProgram(pr.p);
-        bindTex(pr, 'uIn0', src[0]);
-        bindTex(pr, 'uIn1', src[1]);
-        gl.uniform1f(pr.u.uChop, P.chop);
-        drawFullscreen(c.assembleFBO);
-        gl.bindTexture(gl.TEXTURE_2D, c.disp); gl.generateMipmap(gl.TEXTURE_2D);
-        gl.bindTexture(gl.TEXTURE_2D, c.slope); gl.generateMipmap(gl.TEXTURE_2D);
-
-        pr = progs.foam;
-        gl.useProgram(pr.p);
-        bindTex(pr, 'uPrev', c.foam[c.foamIdx]);
-        bindTex(pr, 'uDisp', c.disp);
-        gl.uniform1f(pr.u.uDt, dt);
-        gl.uniform1f(pr.u.uThreshold, 0.45);
-        c.foamIdx ^= 1;
-        drawFullscreen(c.foamFBO[c.foamIdx]);
-        gl.bindTexture(gl.TEXTURE_2D, c.foam[c.foamIdx]); gl.generateMipmap(gl.TEXTURE_2D);
+        drawFullscreen(bufA2.fbo);
+        const res = runFFT(progs.fft2, fftA.slice(0, 2), [bufB2, bufA2]);
+        // Threshold so the folded fraction matches the whitecap law
+        const sj = Math.max(1e-4, P.chop * spectrumStats.sigmaJ[ci]);
+        const z = probit(Math.max(spectrumStats.whitecap, 1e-5));
+        assembleLayer(c, res, P.chop, dt, { threshold: ci === 2 ? -1 : 1 + z * sj, gain: 1.5 / sj, decay: 0.45 });
     }
 }
 
+// Shared uniforms for anything that samples the ocean displacement
+function setDispUniforms(pr) {
+    const wd = P.windDir * Math.PI / 180;
+    gl.uniform2f(pr.u.uWind, Math.cos(wd), Math.sin(wd));
+    gl.uniform3f(pr.u.uL, CASCADES[0], CASCADES[1], CASCADES[2]);
+    gl.uniform3f(pr.u.uWake, wakeState.cx, wakeState.cz, WAKE_L);
+    gl.uniform1f(pr.u.uWakeOn, 1);
+    cascades.forEach((c, i) => bindTex(pr, 'uDisp' + i, c.disp));
+    bindTex(pr, 'uWakeDisp', wake.disp);
+}
+
+// Probes: 0 = camera, 1-4 = hull corners (bow, stern, port, starboard)
+function probePoints() {
+    const { f, s } = boatAxes();
+    const L = BOAT.length * 0.38, B = BOAT.beam * 0.42;
+    const hull = BOAT.length * 0.35;   // hull integrates waves over ~its own size
+    const pts = [
+        [cam.pos[0], cam.pos[2], 2, 1],
+        [boat.x + f[0] * L, boat.z + f[2] * L, hull, 0],
+        [boat.x - f[0] * L, boat.z - f[2] * L, hull, 0],
+        [boat.x + s[0] * B, boat.z + s[2] * B, hull, 0],
+        [boat.x - s[0] * B, boat.z - s[2] * B, hull, 0]
+    ];
+    probeIn.fill(0);
+    pts.forEach((p, i) => probeIn.set(p, i * 4));
+}
+
+function runProbes(sync) {
+    if (probeFence && !sync) {
+        const st = gl.clientWaitSync(probeFence, 0, 0);
+        if (st === gl.TIMEOUT_EXPIRED) return;
+        gl.deleteSync(probeFence);
+        probeFence = null;
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
+        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, probeOut);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        probeValid = true;
+    }
+    probePoints();
+    const pr = progs.probe;
+    gl.useProgram(pr.p);
+    setDispUniforms(pr);
+    gl.uniform4fv(pr.u.uProbe, probeIn);
+    drawFullscreen(probeFBO);
+    if (sync) {
+        gl.readPixels(0, 0, PROBES, 1, gl.RGBA, gl.FLOAT, probeOut);
+        probeValid = true;
+        return;
+    }
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, probePBO);
+    gl.readPixels(0, 0, PROBES, 1, gl.RGBA, gl.FLOAT, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    probeFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+}
+
+function updateBoat(dt) {
+    // Plane motion: autopilot turn rate + manual rudder / throttle
+    const target = P.boat ? Math.max(0, P.boatSpeed + boat.throttle * 4) : 0;
+    boat.speed += (target - boat.speed) * Math.min(1, dt * 0.6);
+    const turn = (P.boatTurn + boat.rudder * 12) * Math.PI / 180 * Math.min(1, boat.speed / 2);
+    boat.heading += turn * dt;
+    boat.x += Math.sin(boat.heading) * boat.speed * dt;
+    boat.z += Math.cos(boat.heading) * boat.speed * dt;
+
+    // Heave / pitch / roll: damped springs toward the probed water plane
+    if (!probeValid) return;
+    const hb = probeOut[4], hs = probeOut[8], hp = probeOut[12], hsb = probeOut[16];
+    const L = BOAT.length * 0.76, B = BOAT.beam * 0.84;
+    const yT = (hb + hs + hp + hsb) * 0.25 - BOAT.draft * 1.15 + boat.speed * 0.02;
+    const pT = Math.atan((hb - hs) / L) + boat.speed * 0.008;      // slight planing bow-up trim
+    const rT = -Math.atan((hp - hsb) / B) - boat.rudder * 0.05 * Math.min(1, boat.speed / 5);
+    const spring = (x, v, t, w, z) => {
+        const a = w * w * (t - x) - 2 * z * w * v;
+        v += a * dt;
+        return [x + v * dt, v];
+    };
+    [boat.y, boat.vy] = spring(boat.y, boat.vy, yT, 2.4, 0.55);
+    [boat.pitch, boat.vp] = spring(boat.pitch, boat.vp, pT, 2.0, 0.5);
+    [boat.roll, boat.vr] = spring(boat.roll, boat.vr, rT, 1.6, 0.35);
+}
+
 // =====================================================================
-//  7. Frame rendering
+//  9. Frame rendering
 // =====================================================================
-function render(time) {
+function render() {
     resize();
     const W = targets.w, H = targets.h;
     const aspect = W / H;
@@ -1087,8 +1714,12 @@ function render(time) {
     const proj = M4.perspective(cam.fov, aspect, 0.3, 60000);
     const viewProj = M4.mul(proj, view);
     const invViewProj = M4.invert(viewProj);
+    lastViewProj = viewProj;
 
     if (sun.dirty) renderSkyLut();
+
+    const haze = P.haze;
+    const betaExt = [5.8e-6 + 2.3e-5 * haze, 13.5e-6 + 2.3e-5 * haze, 33.1e-6 + 2.3e-5 * haze];
 
     // ---- Scene into multisampled HDR target ----
     gl.bindFramebuffer(gl.FRAMEBUFFER, targets.msFBO);
@@ -1107,45 +1738,58 @@ function render(time) {
     gl.bindVertexArray(emptyVAO);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
+    gl.enable(gl.DEPTH_TEST);
+
+    // Boat
+    if (P.boat) {
+        pr = progs.boat;
+        gl.useProgram(pr.p);
+        gl.uniformMatrix4fv(pr.u.uViewProj, false, viewProj);
+        gl.uniformMatrix4fv(pr.u.uModel, false, boatModel());
+        gl.uniform3fv(pr.u.uCamPos, cam.pos);
+        gl.uniform3fv(pr.u.uSunDir, sun.dir);
+        gl.uniform3fv(pr.u.uSunE, sun.E);
+        gl.uniform3fv(pr.u.uBetaExt, betaExt);
+        bindTex(pr, 'uSky', skyLut);
+        gl.bindVertexArray(boatMesh.vao);
+        gl.drawElements(gl.TRIANGLES, boatMesh.count, gl.UNSIGNED_INT, 0);
+    }
+
     // Ocean: projected grid limited to the visible part of the sea plane
     const hz = M4.transform(viewProj, [cam.pos[0] + Math.sin(cam.yaw) * 1e6, 0, cam.pos[2] + Math.cos(cam.yaw) * 1e6, 1]);
-    let horizonY = hz[3] > 0 ? hz[1] / hz[3] : (cam.pitch > 0 ? -2 : 2);
+    const horizonY = hz[3] > 0 ? hz[1] / hz[3] : (cam.pitch > 0 ? -2 : 2);
     if (horizonY > -1.2) {
         const yMax = Math.min(1.25, horizonY + 0.04);
-        const yMin = -1.35;
+        const yMin = -1.35 - Math.min(1.5, spectrumStats.hs / Math.max(cam.pos[1], 1) * 1.5);
         pr = progs.ocean;
         gl.useProgram(pr.p);
-        gl.enable(gl.DEPTH_TEST);
+        setDispUniforms(pr);
         gl.uniformMatrix4fv(pr.u.uViewProj, false, viewProj);
         gl.uniformMatrix4fv(pr.u.uInvViewProj, false, invViewProj);
         gl.uniform3fv(pr.u.uCamPos, cam.pos);
         gl.uniform4f(pr.u.uNdc, -1.3, 1.3, yMin, yMax);
-        const wd = P.windDir * Math.PI / 180;
-        gl.uniform2f(pr.u.uWind, Math.cos(wd), Math.sin(wd));
-        gl.uniform3f(pr.u.uL, CASCADES[0], CASCADES[1], CASCADES[2]);
         gl.uniform1f(pr.u.uVertexAngle, cam.fov * ((yMax - yMin) / 2) / grid.rows * 1.5);
         gl.uniform1f(pr.u.uFar, FAR);
         gl.uniform3fv(pr.u.uSunDir, sun.dir);
         gl.uniform3fv(pr.u.uSunE, sun.E);
         gl.uniform2fv(pr.u.uUnresolved, spectrumStats.unresolved);
-        const haze = P.haze;
-        gl.uniform3f(pr.u.uBetaExt, 5.8e-6 + 2.3e-5 * haze, 13.5e-6 + 2.3e-5 * haze, 33.1e-6 + 2.3e-5 * haze);
+        gl.uniform3fv(pr.u.uBetaExt, betaExt);
         gl.uniform1f(pr.u.uFilter, P.filter === 'bruneton' ? 1 : 0);
         gl.uniform1f(pr.u.uFoamOn, P.foam ? 1 : 0);
         gl.uniform1f(pr.u.uDebug, P.cascadeDebug ? 1 : 0);
         gl.uniform1f(pr.u.uHs, spectrumStats.hs);
-        gl.uniform1f(pr.u.uTime, time);
         cascades.forEach((c, i) => {
-            bindTex(pr, 'uDisp' + i, c.disp);
             bindTex(pr, 'uSlope' + i, c.slope);
             bindTex(pr, 'uFoam' + i, c.foam[c.foamIdx]);
         });
+        bindTex(pr, 'uWakeSlope', wake.slope);
+        bindTex(pr, 'uWakeFoam', wake.foam[wake.foamIdx]);
         bindTex(pr, 'uSky', skyLut);
         gl.bindVertexArray(grid.vao);
         gl.drawElements(gl.TRIANGLES, grid.count, gl.UNSIGNED_INT, 0);
-        gl.bindVertexArray(null);
-        gl.disable(gl.DEPTH_TEST);
     }
+    gl.bindVertexArray(null);
+    gl.disable(gl.DEPTH_TEST);
 
     // Resolve MSAA
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, targets.msFBO);
@@ -1191,7 +1835,7 @@ function render(time) {
 }
 
 // =====================================================================
-//  8. UI
+//  10. UI
 // =====================================================================
 const UI = [
     { section: 'Sea state' },
@@ -1200,8 +1844,13 @@ const UI = [
     { id: 'swell', label: 'Swell', min: 0, max: 1, step: 0.01, spectrum: true },
     { id: 'depth', label: 'Water depth', min: 2, max: 300, step: 1, unit: ' m', spectrum: true },
     { id: 'windDir', label: 'Wind direction', min: 0, max: 360, step: 1, unit: '°' },
-    { id: 'chop', label: 'Choppiness', min: 0, max: 1.6, step: 0.01 },
+    { id: 'chop', label: 'Choppiness', min: 0, max: 1.6, step: 0.01, spectrum: true },
     { id: 'timeScale', label: 'Time scale', min: 0, max: 2, step: 0.01, unit: '×' },
+    { section: 'Boat & wakes' },
+    { id: 'boat', label: 'Boat', type: 'check' },
+    { id: 'chase', label: 'Chase camera (WASD steers)', type: 'check' },
+    { id: 'boatSpeed', label: 'Cruise speed', min: 0, max: 14, step: 0.1, unit: ' m/s' },
+    { id: 'boatTurn', label: 'Autopilot turn rate', min: -10, max: 10, step: 0.1, unit: '°/s' },
     { section: 'Sky & light' },
     { id: 'sunEl', label: 'Sun elevation', min: -2, max: 75, step: 0.1, unit: '°', sky: true },
     { id: 'sunAz', label: 'Sun azimuth', min: 0, max: 360, step: 1, unit: '°', sky: true },
@@ -1209,19 +1858,19 @@ const UI = [
     { id: 'exposure', label: 'Exposure', min: -3, max: 3, step: 0.05, unit: ' EV' },
     { section: 'Rendering' },
     { id: 'filter', label: 'Distant-wave shading', type: 'select', options: [
-        ['bruneton', 'Slope-variance BRDF (filtered)'], ['naive', 'Mean normal only (naive)']] },
+        ['bruneton', 'Slope-variance BRDF (filtered)'], ['naive', 'Fixed roughness (naive)']] },
     { id: 'quality', label: 'Quality', type: 'select', options: [['high', 'High'], ['medium', 'Medium'], ['low', 'Low']] },
     { id: 'foam', label: 'Whitecaps', type: 'check' },
     { id: 'bloom', label: 'Bloom', type: 'check' },
-    { id: 'cascadeDebug', label: 'Tint cascades (R/G/B)', type: 'check' },
+    { id: 'cascadeDebug', label: 'Tint cascades (R/G/B, wake = gold)', type: 'check' },
 ];
 
 const PRESETS = {
-    'Golden hour': { wind: 9, fetch: 120, swell: 0.3, depth: 200, chop: 1.0, sunEl: 7, sunAz: 180, haze: 1.0, exposure: 0 },
-    'Calm noon': { wind: 3.5, fetch: 40, swell: 0.6, depth: 200, chop: 0.8, sunEl: 55, sunAz: 150, haze: 0.6, exposure: -0.6 },
-    'Storm': { wind: 21, fetch: 500, swell: 0.1, depth: 300, chop: 1.35, sunEl: 18, sunAz: 120, haze: 3.2, exposure: 0.3 },
-    'Shallow bay': { wind: 7, fetch: 25, swell: 0.4, depth: 4, chop: 1.0, sunEl: 30, sunAz: 200, haze: 0.8, exposure: -0.3 },
-    'Dusk': { wind: 6, fetch: 200, swell: 0.7, depth: 200, chop: 0.9, sunEl: 0.6, sunAz: 175, haze: 1.6, exposure: 1.2 }
+    'Golden hour': { wind: 8, fetch: 120, swell: 0.35, depth: 200, chop: 1.0, sunEl: 7, sunAz: 180, haze: 1.0, exposure: 0, boatSpeed: 7, boatTurn: 2.5 },
+    'Calm noon': { wind: 3.5, fetch: 40, swell: 0.6, depth: 200, chop: 0.8, sunEl: 55, sunAz: 150, haze: 0.6, exposure: -0.6, boatSpeed: 9, boatTurn: 0 },
+    'Storm': { wind: 21, fetch: 500, swell: 0.1, depth: 300, chop: 1.3, sunEl: 18, sunAz: 120, haze: 3.2, exposure: 0.3, boatSpeed: 4, boatTurn: 1 },
+    'Shallow bay': { wind: 5, fetch: 25, swell: 0.4, depth: 4, chop: 0.9, sunEl: 30, sunAz: 200, haze: 0.8, exposure: -0.3, boatSpeed: 6.5, boatTurn: 0 },
+    'Dusk': { wind: 6, fetch: 200, swell: 0.7, depth: 200, chop: 0.9, sunEl: 0.6, sunAz: 175, haze: 1.6, exposure: 1.2, boatSpeed: 5, boatTurn: 3 }
 };
 
 let spectrumDirty = true;
@@ -1260,7 +1909,7 @@ function buildUI() {
             const input = row.querySelector('input');
             input.checked = P[def.id];
             input.onchange = () => { P[def.id] = input.checked; };
-            inputs[def.id] = input;
+            inputs[def.id] = { check: input };
         } else if (def.type === 'select') {
             row.className = 'row';
             row.innerHTML = `<div class="top"><span>${def.label}</span></div><select></select>`;
@@ -1269,9 +1918,9 @@ function buildUI() {
             sel.value = P[def.id];
             sel.onchange = () => {
                 P[def.id] = sel.value;
-                if (def.id === 'quality') { const q = QUALITY[P.quality]; buildGrid(q.grid[0], q.grid[1]); targets = targets && { ...targets, w: -1 }; }
+                if (def.id === 'quality') { const q = QUALITY[P.quality]; buildGrid(q.grid[0], q.grid[1]); resize(true); }
             };
-            inputs[def.id] = sel;
+            inputs[def.id] = { select: sel };
         } else {
             row.className = 'row';
             row.innerHTML = `<div class="top"><span>${def.label}</span><b></b></div><input type="range" min="${def.min}" max="${def.max}" step="${def.step}">`;
@@ -1283,6 +1932,7 @@ function buildUI() {
                 out.textContent = fmt(def, P[def.id]);
                 if (def.spectrum) spectrumDirty = true;
                 if (def.sky) updateSun();
+                updateHud();
             };
             inputs[def.id] = { input, out, def };
         }
@@ -1296,7 +1946,6 @@ function applyPreset(p) {
         const c = inputs[id];
         if (c && c.input) { c.input.value = P[id]; c.out.textContent = fmt(c.def, P[id]); }
     }
-    cam.yaw = P.sunAz * Math.PI / 180 + 0.32;
     spectrumDirty = true;
     updateSun();
 }
@@ -1314,84 +1963,128 @@ function beaufort(u) {
     for (let i = 0; i < scale.length; i++) if (u < scale[i][0]) return `Bft ${i} · ${scale[i][1]}`;
 }
 
+function updateHud() {
+    document.getElementById('hudSea').textContent = beaufort(P.wind);
+    document.getElementById('hudHs').textContent = spectrumStats.hs.toFixed(2) + ' m';
+    document.getElementById('hudTp').textContent = `${spectrumStats.tp.toFixed(1)} s · ${Math.round(spectrumStats.lp)} m`;
+    document.getElementById('hudWc').textContent = (spectrumStats.whitecap * 100).toFixed(spectrumStats.whitecap < 0.01 ? 2 : 1) + ' %';
+    const fr = boat.speed / Math.sqrt(G * P.depth);
+    const regime = fr < 0.7 ? 'Kelvin 19.5°' : fr < 1 ? 'near-critical' : 'supercritical';
+    document.getElementById('hudBoat').textContent = P.boat ? `${boat.speed.toFixed(1)} m/s · ${fr.toFixed(2)} (${regime})` : 'off';
+}
+
 document.getElementById('about').innerHTML = `
 <h3>How this ocean works</h3>
-<p>Everything you see is computed on the GPU every frame, from a physical description of the sea state.</p>
+<p>Everything is computed on the GPU every frame from a physical description of the sea state. The papers each part builds on are named in italics.</p>
 <h4>Waves: FFT synthesis</h4>
-<p>The surface is a sum of ~200,000 sine waves per patch, evaluated with an inverse FFT
-(Tessendorf, <i>Simulating Ocean Water</i>, SIGGRAPH course 2001). Three patches of 400 m, 61 m and 11 m are layered,
-each owning its own band of wavelengths so nothing is counted twice and tiling is hidden.
-Points are also pushed sideways toward crests ("choppy" waves).</p>
+<p>Each of three patches (400 m, 61 m, 11 m) is a sum of 65,536 waves evaluated with an inverse FFT
+(Tessendorf, <i>Simulating Ocean Water</i>, SIGGRAPH course 2001). Each patch owns its own band of wavelengths, so nothing
+is counted twice and tiling is hidden. Points are also pushed sideways toward crests ("choppy" waves).</p>
 <h4>Which waves exist: the spectrum</h4>
-<p>Wave energy per wavelength and direction follows the empirical model of Horvath (<i>Empirical directional wave spectra
-for computer graphics</i>, 2015): JONSWAP for wind speed and fetch, TMA for shallow water, Donelan–Banner directional spreading,
-and a swell term that stretches crests sideways. The HUD's wave height and period are computed from the same spectrum.</p>
-<h4>Shading distant waves without sparkle noise</h4>
-<p>Far away, many waves fall inside one pixel. Each patch stores slope <i>and</i> slope² in a mip-mapped texture;
-the GPU's filtering then gives the mean <i>and the variance</i> of slopes under every pixel. That variance widens the sun's
-reflection lobe and blurs the sky reflection (Bruneton, Neyret &amp; Holzschuch, <i>Real-time Realistic Ocean Lighting using
-Seamless Transitions from Geometry to BRDF</i>, 2010). Slopes too small for any patch are filled in from Cox &amp; Munk's
-1954 sun-glitter measurements. Switch "Distant-wave shading" to <i>naive</i> to see the difference at the horizon.</p>
+<p>Wave energy per wavelength and direction follows Horvath (<i>Empirical directional wave spectra for computer graphics</i>, 2015):
+JONSWAP for wind speed and fetch, TMA for shallow water, Donelan–Banner spreading and a swell term. The HUD's wave
+height and period come from the same spectrum.</p>
+<h4>Shading distant waves without sparkle</h4>
+<p>Each patch stores slope <i>and</i> slope² in mip-mapped textures, so filtering yields the mean <i>and variance</i> of slopes
+under every pixel. That variance widens the sun's reflection and blurs the sky reflection (Bruneton, Neyret &amp; Holzschuch,
+<i>Seamless Transitions from Geometry to BRDF</i>, 2010). Slopes finer than any patch are filled in from Cox &amp; Munk's 1954
+sun-glitter measurements.</p>
 <h4>Whitecaps</h4>
-<p>Where choppy waves compress the surface until it almost folds (Jacobian &lt; threshold), foam is injected and then
-slowly decays, leaving trails behind breaking crests (Dupuy &amp; Bruneton, SIGGRAPH Asia 2012 technical brief).</p>
-<h4>Sky and light</h4>
-<p>The sky is ray-marched single Rayleigh + Mie scattering (Nishita et al., SIGGRAPH 1993), stored in a lookup texture
-that is also used for reflections, sun colour and aerial perspective. Bloom follows Jimenez's SIGGRAPH 2014 course notes.</p>
+<p>Foam appears where the surface nearly folds (Jacobian below a threshold) and then decays (Dupuy &amp; Bruneton 2012).
+Here the threshold is not hand-tuned: the spectrum predicts the Jacobian's spread per patch, and the threshold is placed so
+the foaming fraction equals Monahan &amp; O'Muircheartaigh's (1980) measured whitecap coverage, W = 3.84·10⁻⁶·U<sup>3.41</sup>.</p>
+<h4>Sky</h4>
+<p>Single-scattering Rayleigh + Mie with an ozone layer (Nishita et al. 1993; Bruneton 2017), used for the background,
+reflections, sun colour and aerial perspective. Bloom follows Jimenez (SIGGRAPH 2014).</p>
+<div class="new">
+<h4>New here: a dynamic spectral cascade</h4>
+<p>FFT oceans are pure synthesis: they cannot react to a boat. Interactive solvers (iWave, wave packets, wavelets) react,
+but live in a separate pipeline with their own dispersion approximation, shading and foam. This demo adds a <b>fourth FFT
+cascade that is simulated rather than synthesized</b>: a 256 m window following the boat holds the linearised free-surface
+equations, where every Fourier mode is a harmonic oscillator advanced <i>exactly</i> by a rotation through ω(k)·Δt, with
+ω² = g·k·tanh(k·h) — the same finite-depth dispersion the wind spectrum uses. Sources (the hull's pressure, stones you
+drop by clicking) are applied in real space; an absorbing sponge stops wrap-around; recentring is an exact texel shift.</p>
+<p>Because it outputs the same displacement, slope-moment and Jacobian fields as the wind cascades, wakes get Bruneton filtering
+and Monahan-calibrated foam for free, and the physics falls out on its own: a 19.5° Kelvin wedge in deep water, which
+widens and loses its transverse waves as the depth Froude number U/√(gh) passes 1 (try the <i>Shallow bay</i> preset and
+raise the boat speed), and dispersive rings from a dropped stone, with short ripples running ahead of long waves.</p>
+<h4>New here: floating bodies from GPU probes</h4>
+<p>The boat's heave, pitch and roll come from asynchronous GPU probes. Choppy waves move water sideways, so each probe inverts
+the displacement with a fixed-point iteration (x₀ ← x − D(x₀)). It also samples the cascades at the mip level matching
+the hull size, so the hull averages out ripples smaller than itself, as a real hull does. Damped springs then give the boat inertia.</p>
+</div>
 `;
 
 // =====================================================================
-//  9. Main loop
+//  11. Main loop
 // =====================================================================
 buildUI();
 updateSun();
 buildGrid(...QUALITY[P.quality].grid);
+boat.heading = P.sunAz * Math.PI / 180 - Math.PI - cam.orbitYaw + 0.3;   // sun just beside the boat in the opening shot
+boat.speed = P.boatSpeed;
 
-let simTime = 0, last = performance.now(), frames = 0, fpsTime = 0, msAvg = 16;
+let simTime = 0, last = performance.now(), frames = 0, fpsTime = 0, running = true;
+
+function step(dt, sync) {
+    if (spectrumDirty) { uploadSpectra(); spectrumDirty = false; updateHud(); }
+    const sdt = dt * P.timeScale;
+    simTime += sdt;
+    updateBoat(sdt);
+    updateCamera(dt);
+    simulate(simTime, Math.max(sdt, 1e-4));
+    runProbes(sync);
+}
+
 function frame(now) {
     if (!running) return;
     const dt = Math.min(0.1, (now - last) / 1000);
     last = now;
-    if (spectrumDirty) { uploadSpectra(); spectrumDirty = false; updateHud(); }
-    const sdt = P.freeze ? 0 : dt * P.timeScale;
-    simTime += sdt;
-    updateCamera(dt);
-    simulate(simTime, Math.max(sdt, 1e-4));
-    render(simTime);
-
-    frames++; fpsTime += dt; msAvg = msAvg * 0.95 + dt * 1000 * 0.05;
+    step(dt, false);
+    render();
+    frames++; fpsTime += dt;
     if (fpsTime > 0.5) {
         document.getElementById('hudFps').textContent = `${Math.round(frames / fpsTime)} fps · ${targets.w}×${targets.h}`;
+        updateHud();
         frames = 0; fpsTime = 0;
     }
-    if (running) requestAnimationFrame(frame);
+    requestAnimationFrame(frame);
 }
 
-function updateHud() {
-    document.getElementById('hudSea').textContent = beaufort(P.wind);
-    document.getElementById('hudHs').textContent = spectrumStats.hs.toFixed(2) + ' m';
-    document.getElementById('hudTp').textContent = spectrumStats.tp.toFixed(1) + ' s';
-    document.getElementById('hudLp').textContent = Math.round(spectrumStats.lp) + ' m';
-}
-
-let running = true;
 // Deterministic capture hook (used for automated screenshots): pauses the
-// live loop, simulates up to time t and returns the frame as a PNG data URL.
-function still(t, warmup = 1) {
+// live loop, advances the simulation by `seconds` in fixed steps and
+// returns the frame as a PNG data URL.
+function still(seconds = 0, dt = 1 / 30) {
     running = false;
-    if (spectrumDirty) { uploadSpectra(); spectrumDirty = false; updateHud(); }
-    const dt = 1 / 30;
-    for (let i = warmup; i > 0; i--) {
-        simTime = t - i * dt;
-        simulate(simTime, dt);
-    }
-    simTime = t;
-    simulate(simTime, dt);
-    render(simTime);
+    const n = Math.round(seconds / dt);
+    for (let i = 0; i < n; i++) step(dt, true);
+    step(1e-4, true);
+    render();
+    updateHud();
     return canvas.toDataURL('image/png');
 }
 
-window.__ocean = { P, cam, applyPreset, PRESETS, spectrumStats, sun, updateSun, still,
+function readTex(tex, w = N, h = N) {
+    const f = makeFBO([tex]);
+    const out = new Float32Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, out);
+    gl.deleteFramebuffer(f);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return out;
+}
+
+function clearWake() {
+    for (const t of [fftB[2], ...wake.foam]) {
+        const f = makeFBO([t]);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.deleteFramebuffer(f);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+window.__ocean = { P, cam, boat, clearWake, cascades, wake, applyPreset, PRESETS, spectrumStats, sun, updateSun, still, readTex,
+    splash: (x, z) => { pendingSplash = { x, z }; },
     resume: () => { if (!running) { running = true; last = performance.now(); requestAnimationFrame(frame); } } };
 requestAnimationFrame(frame);
 </script>
