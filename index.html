@@ -81,6 +81,9 @@
         }
 
         canvas {
+            max-width: 100%;
+            height: auto;
+            touch-action: none;
             border: 2px solid #00ffff;
             border-radius: 12px;
             box-shadow: 0 0 30px rgba(0, 255, 255, 0.3);
@@ -119,6 +122,36 @@
         .stats span {
             color: #00ffff;
         }
+
+        .stats em {
+            font-style: normal;
+        }
+
+        .surface-only {
+            display: none;
+        }
+
+        body.show-surface .surface-only {
+            display: flex;
+        }
+
+        .toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 15px;
+            border: 2px solid #00ffff;
+            border-radius: 8px;
+            background: rgba(0, 0, 0, 0.5);
+            color: #fff;
+            font-size: 14px;
+            text-transform: none;
+            cursor: pointer;
+        }
+
+        .toggle input {
+            accent-color: #00ffff;
+        }
     </style>
 </head>
 <body>
@@ -133,6 +166,7 @@
                 <option value="2">Pulsating Icosahedron</option>
                 <option value="3">Lorenz Attractor</option>
                 <option value="4">Morphing Torus Knot</option>
+                <option value="5">Ocean Waves</option>
             </select>
         </div>
 
@@ -145,6 +179,16 @@
             <label>Zoom</label>
             <input type="range" id="zoomSlider" min="50" max="300" value="150">
         </div>
+
+        <div class="control-group surface-only">
+            <label>Wave Height</label>
+            <input type="range" id="waveSlider" min="0" max="200" value="100">
+        </div>
+
+        <div class="control-group surface-only">
+            <label>Overlay</label>
+            <label class="toggle"><input type="checkbox" id="wireToggle"> Wireframe</label>
+        </div>
     </div>
 
     <canvas id="canvas" width="800" height="600"></canvas>
@@ -154,7 +198,7 @@
         <p id="shapeDescription">A tesseract is a 4-dimensional hypercube projected into 3D space. Watch as it rotates through the 4th dimension, creating seemingly impossible geometric transformations.</p>
         <div class="stats">
             <div>Vertices: <span id="vertexCount">0</span></div>
-            <div>Edges: <span id="edgeCount">0</span></div>
+            <div><em id="edgeLabel">Edges</em>: <span id="edgeCount">0</span></div>
             <div>FPS: <span id="fps">0</span></div>
         </div>
     </div>
@@ -198,8 +242,14 @@
                     this.generateDNAHelix.bind(this),
                     this.generatePulsatingIcosahedron.bind(this),
                     this.generateLorenzAttractor.bind(this),
-                    this.generateTorusKnot.bind(this)
+                    this.generateTorusKnot.bind(this),
+                    this.generateOcean.bind(this)
                 ];
+
+                // Shapes drawn as shaded surfaces instead of wireframes
+                this.surfaceShapes = new Set([5]);
+                this.isSurface = false;
+                this.initOcean();
 
                 // FPS tracking
                 this.lastTime = performance.now();
@@ -497,11 +547,339 @@
                 });
             }
 
+
+            // ============================================
+            // Water Rendering
+            // Gerstner waves, sky + sun, Fresnel reflection,
+            // specular glints, subsurface scatter, foam, fog
+            // ============================================
+
+            initOcean() {
+                this.waveScale = 1;
+                this.showWireframeOverlay = false;
+
+                const rows = 72;
+                const cols = 80;
+                const count = (rows + 1) * (cols + 1);
+
+                const sun = [0, 0.17, 1];
+                const sunLen = Math.hypot(sun[0], sun[1], sun[2]);
+
+                const zenith = [0.10, 0.20, 0.45];
+                const horizon = [0.98, 0.70, 0.48];
+                const deep = [0.02, 0.10, 0.17];
+
+                this.ocean = {
+                    rows, cols, count,
+                    camHeight: 3.2,
+                    far: 350,
+                    focal: 600,
+                    yaw: 0,
+                    pitch: 0.1,
+                    sunDir: sun.map(v => v / sunLen),
+                    zenith,
+                    horizon,
+                    sunColor: [1.0, 0.86, 0.62],
+                    deep,
+                    scatter: [0.04, 0.38, 0.40],
+                    foamColor: [0.92, 0.95, 0.97],
+                    fogColor: horizon.map((h, i) => h * 0.8 + deep[i] * 0.2),
+                    fogDensity: 0.009,
+                    // Wave spectrum: wavelength L, amplitude A, steepness Q,
+                    // direction angle relative to "rolling toward the camera"
+                    waves: [
+                        { L: 26, A: 0.85, Q: 0.75, angle: 0.0 },
+                        { L: 15, A: 0.45, Q: 0.70, angle: 0.45 },
+                        { L: 9.5, A: 0.28, Q: 0.70, angle: -0.6 },
+                        { L: 5.5, A: 0.14, Q: 0.60, angle: 1.1 },
+                        { L: 3.2, A: 0.07, Q: 0.50, angle: -1.4 },
+                        { L: 1.9, A: 0.035, Q: 0.40, angle: 0.3 }
+                    ].map((w, i) => {
+                        const k = (Math.PI * 2) / w.L;
+                        return {
+                            ...w,
+                            k,
+                            omega: Math.sqrt(9.8 * k), // deep-water dispersion
+                            dx: Math.sin(w.angle),
+                            dz: -Math.cos(w.angle),
+                            phase: i * 1.7
+                        };
+                    }),
+                    // Per-vertex buffers
+                    px: new Float32Array(count), py: new Float32Array(count), pz: new Float32Array(count),
+                    nx: new Float32Array(count), ny: new Float32Array(count), nz: new Float32Array(count),
+                    foam: new Float32Array(count), dist: new Float32Array(count),
+                    sx: new Float32Array(count), sy: new Float32Array(count), cz: new Float32Array(count)
+                };
+            }
+
+            // Builds a camera-aligned grid (dense near the camera, sparse near the horizon),
+            // samples Gerstner waves at world positions and projects with real perspective.
+            generateOcean(time) {
+                const o = this.ocean;
+                const W = this.width;
+                const H = this.height;
+                const f = this.zoom * 4;
+                const yaw = this.rotationY;
+                const pitch = Math.min(0.9, Math.max(0, 0.1 + this.rotationX * 0.5));
+                o.focal = f;
+                o.yaw = yaw;
+                o.pitch = pitch;
+
+                const sinY = Math.sin(yaw), cosY = Math.cos(yaw);
+                const sinP = Math.sin(pitch), cosP = Math.cos(pitch);
+                const camH = o.camHeight;
+
+                // Nearest visible water: where the bottom screen edge hits the sea
+                const vHalf = Math.atan((H / 2) / f);
+                const near = Math.max(0.5, camH / Math.tan(Math.min(pitch + vHalf, 1.4)) * 0.6 - 1);
+                const far = o.far;
+                const lateralK = (W / 2) / f * 1.1;
+
+                // Keep total steepness below 1 so crests never loop over themselves
+                let sumQkA = 0;
+                for (const w of o.waves) sumQkA += w.Q * w.k * w.A;
+                const scale = this.waveScale;
+                const qScale = Math.min(1, 0.92 / (sumQkA * scale + 1e-6));
+
+                let idx = 0;
+                for (let r = 0; r <= o.rows; r++) {
+                    const ahead = near * Math.pow(far / near, r / o.rows);
+                    const half = (ahead * cosP + camH * sinP) * lateralK + 1.5;
+
+                    for (let c = 0; c <= o.cols; c++, idx++) {
+                        const lat = (c / o.cols * 2 - 1) * half;
+                        const x0 = sinY * ahead + cosY * lat;
+                        const z0 = cosY * ahead - sinY * lat;
+                        const dist = Math.hypot(ahead, lat);
+
+                        let x = x0, y = 0, z = z0;
+                        let nx = 0, ny = 1, nz = 0, crest = 0;
+
+                        for (const w of o.waves) {
+                            // Fade short waves with distance (cheap anti-aliasing)
+                            const fade = 1 - dist / (w.L * 12);
+                            if (fade <= 0) continue;
+                            const A = w.A * scale * fade;
+                            const Q = w.Q * qScale;
+                            const theta = w.k * (w.dx * x0 + w.dz * z0) - w.omega * time + w.phase;
+                            const cs = Math.cos(theta);
+                            const sn = Math.sin(theta);
+                            const kA = w.k * A;
+
+                            x += Q * A * w.dx * cs;
+                            z += Q * A * w.dz * cs;
+                            y += A * sn;
+
+                            nx -= w.dx * kA * cs;
+                            nz -= w.dz * kA * cs;
+                            ny -= Q * kA * sn;
+                            crest += Q * kA * sn;
+                        }
+
+                        const nLen = Math.hypot(nx, ny, nz) || 1;
+                        o.px[idx] = x; o.py[idx] = y; o.pz[idx] = z;
+                        o.nx[idx] = nx / nLen; o.ny[idx] = ny / nLen; o.nz[idx] = nz / nLen;
+                        o.foam[idx] = Math.min(1, Math.max(0, (crest - 0.36) / 0.25));
+                        o.dist[idx] = dist;
+
+                        // World -> camera (camera sits at (0, camH, 0))
+                        const dy = y - camH;
+                        const x1 = x * cosY - z * sinY;
+                        const z1 = x * sinY + z * cosY;
+                        const y2 = dy * cosP + z1 * sinP;
+                        const z2 = z1 * cosP - dy * sinP;
+                        o.cz[idx] = z2;
+                        if (z2 > 0.05) {
+                            o.sx[idx] = W / 2 + f * x1 / z2;
+                            o.sy[idx] = H / 2 - f * y2 / z2;
+                        }
+                    }
+                }
+
+                this.vertices = [];
+                this.edges = [];
+                this.colors = [];
+            }
+
+            // Physically-inspired water shading for one surface patch
+            shadeWater(px, py, pz, nx, ny, nz, foam, dist) {
+                const o = this.ocean;
+                const L = o.sunDir;
+
+                // View vector (surface -> camera)
+                let vx = -px, vy = o.camHeight - py, vz = -pz;
+                const vLen = Math.hypot(vx, vy, vz) || 1;
+                vx /= vLen; vy /= vLen; vz /= vLen;
+
+                const ndv = Math.max(0, nx * vx + ny * vy + nz * vz);
+                const fresnel = 0.02 + 0.98 * Math.pow(1 - ndv, 5); // Schlick
+
+                // Reflection vector
+                const rx = -vx + 2 * ndv * nx;
+                const ry = -vy + 2 * ndv * ny;
+                const rz = -vz + 2 * ndv * nz;
+                const rdl = Math.max(0, rx * L[0] + ry * L[1] + rz * L[2]);
+
+                // Reflected sky (gradient + sun haze)
+                const t = Math.pow(1 - Math.max(ry, 0), 3);
+                const haze = Math.pow(rdl, 8) * 0.35;
+                const spec = Math.pow(rdl, 500) * 8 + Math.pow(rdl, 60) * 0.6;
+
+                // Body colour: deep water + light scattering through backlit crests
+                const ndl = Math.max(0, nx * L[0] + ny * L[1] + nz * L[2]);
+                const hn = Math.min(1, Math.max(0, (py / (this.waveScale * 0.85 + 0.01) + 0.2) / 1.4));
+                const backlit = Math.max(0, -(vx * L[0] + vy * L[1] + vz * L[2]));
+                const sss = hn * hn * (0.35 + 0.65 * backlit);
+
+                const fogT = 1 - Math.exp(-dist * o.fogDensity);
+                const foamT = foam;
+                const specW = spec * (0.15 + fresnel);
+
+                const out = [0, 0, 0];
+                for (let i = 0; i < 3; i++) {
+                    const refl = o.zenith[i] + (o.horizon[i] - o.zenith[i]) * t + o.sunColor[i] * haze;
+                    const body = o.deep[i] * (0.5 + 0.5 * ndl) + o.scatter[i] * sss;
+                    let col = body * (1 - fresnel) + refl * fresnel + o.sunColor[i] * specW;
+                    const foamCol = o.foamColor[i] * (0.55 + 0.45 * ndl) + o.sunColor[i] * 0.1;
+                    col += (foamCol - col) * foamT;
+                    col += (o.fogColor[i] - col) * fogT;
+                    out[i] = Math.min(255, Math.max(0, col * 255)) | 0;
+                }
+                return `rgb(${out[0]},${out[1]},${out[2]})`;
+            }
+
+            // Camera-space direction -> screen (for sky objects at infinity)
+            projectDirection(d) {
+                const o = this.ocean;
+                const sinY = Math.sin(o.yaw), cosY = Math.cos(o.yaw);
+                const sinP = Math.sin(o.pitch), cosP = Math.cos(o.pitch);
+                const x1 = d[0] * cosY - d[2] * sinY;
+                const z1 = d[0] * sinY + d[2] * cosY;
+                const y2 = d[1] * cosP + z1 * sinP;
+                const z2 = z1 * cosP - d[1] * sinP;
+                if (z2 <= 0.01) return null;
+                return [this.width / 2 + o.focal * x1 / z2, this.height / 2 - o.focal * y2 / z2];
+            }
+
+            renderSky() {
+                const ctx = this.ctx;
+                const o = this.ocean;
+                const W = this.width, H = this.height;
+                const rgb = (c, a = 1) => `rgba(${c[0] * 255 | 0},${c[1] * 255 | 0},${c[2] * 255 | 0},${a})`;
+
+                const horizonY = H / 2 - o.focal * Math.tan(o.pitch);
+
+                const sky = ctx.createLinearGradient(0, horizonY - H * 1.1, 0, horizonY);
+                sky.addColorStop(0, rgb(o.zenith));
+                sky.addColorStop(0.7, rgb(o.zenith.map((z, i) => z * 0.5 + o.horizon[i] * 0.5)));
+                sky.addColorStop(1, rgb(o.horizon));
+                ctx.globalAlpha = 1;
+                ctx.fillStyle = sky;
+                ctx.fillRect(0, 0, W, H);
+
+                // Sun with glow
+                const sun = this.projectDirection(o.sunDir);
+                if (sun) {
+                    const glow = ctx.createRadialGradient(sun[0], sun[1], 0, sun[0], sun[1], 220);
+                    glow.addColorStop(0, rgb(o.sunColor, 0.9));
+                    glow.addColorStop(0.15, rgb(o.sunColor, 0.45));
+                    glow.addColorStop(1, rgb(o.sunColor, 0));
+                    ctx.fillStyle = glow;
+                    ctx.fillRect(0, 0, W, H);
+
+                    ctx.beginPath();
+                    ctx.arc(sun[0], sun[1], 13, 0, Math.PI * 2);
+                    ctx.fillStyle = '#fff7e6';
+                    ctx.fill();
+                }
+
+                // Distant sea beyond the mesh blends into fog
+                if (horizonY < H) {
+                    ctx.fillStyle = rgb(o.fogColor);
+                    ctx.fillRect(0, Math.max(0, horizonY), W, H);
+                }
+            }
+
+            renderSurface() {
+                const ctx = this.ctx;
+                const o = this.ocean;
+                const W = this.width, H = this.height;
+                const stride = o.cols + 1;
+
+                this.renderSky();
+
+                ctx.lineWidth = 1;
+                ctx.lineJoin = 'round';
+                let faces = 0;
+
+                // Painter's algorithm: rows are already ordered by distance
+                for (let r = o.rows - 1; r >= 0; r--) {
+                    for (let c = 0; c < o.cols; c++) {
+                        const a = r * stride + c;
+                        const b = a + 1;
+                        const d = a + stride;
+                        const e = d + 1;
+
+                        if (o.cz[a] <= 0.05 || o.cz[b] <= 0.05 || o.cz[d] <= 0.05 || o.cz[e] <= 0.05) continue;
+
+                        const minX = Math.min(o.sx[a], o.sx[b], o.sx[d], o.sx[e]);
+                        const maxX = Math.max(o.sx[a], o.sx[b], o.sx[d], o.sx[e]);
+                        const minY = Math.min(o.sy[a], o.sy[b], o.sy[d], o.sy[e]);
+                        const maxY = Math.max(o.sy[a], o.sy[b], o.sy[d], o.sy[e]);
+                        if (maxX < 0 || minX > W || maxY < 0 || minY > H) continue;
+
+                        let nx = o.nx[a] + o.nx[b] + o.nx[d] + o.nx[e];
+                        let ny = o.ny[a] + o.ny[b] + o.ny[d] + o.ny[e];
+                        let nz = o.nz[a] + o.nz[b] + o.nz[d] + o.nz[e];
+                        const nLen = Math.hypot(nx, ny, nz) || 1;
+                        nx /= nLen; ny /= nLen; nz /= nLen;
+
+                        const color = this.shadeWater(
+                            (o.px[a] + o.px[b] + o.px[d] + o.px[e]) / 4,
+                            (o.py[a] + o.py[b] + o.py[d] + o.py[e]) / 4,
+                            (o.pz[a] + o.pz[b] + o.pz[d] + o.pz[e]) / 4,
+                            nx, ny, nz,
+                            (o.foam[a] + o.foam[b] + o.foam[d] + o.foam[e]) / 4,
+                            (o.dist[a] + o.dist[b] + o.dist[d] + o.dist[e]) / 4
+                        );
+
+                        ctx.beginPath();
+                        ctx.moveTo(o.sx[a], o.sy[a]);
+                        ctx.lineTo(o.sx[b], o.sy[b]);
+                        ctx.lineTo(o.sx[e], o.sy[e]);
+                        ctx.lineTo(o.sx[d], o.sy[d]);
+                        ctx.closePath();
+                        ctx.fillStyle = color;
+                        ctx.fill();
+                        // Same-colour stroke hides anti-aliasing seams between patches
+                        ctx.strokeStyle = color;
+                        ctx.stroke();
+
+                        if (this.showWireframeOverlay) {
+                            ctx.strokeStyle = 'rgba(0, 255, 255, 0.35)';
+                            ctx.lineWidth = 0.6;
+                            ctx.stroke();
+                            ctx.lineWidth = 1;
+                        }
+                        faces++;
+                    }
+                }
+
+                this.surfaceStats = { vertices: o.count, faces };
+            }
+
             // ============================================
             // Rendering
             // ============================================
 
             render() {
+                if (this.isSurface) {
+                    this.renderSurface();
+                    this.updateStats(this.surfaceStats.vertices, this.surfaceStats.faces);
+                    return;
+                }
+
                 // Clear canvas
                 this.ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
                 this.ctx.fillRect(0, 0, this.width, this.height);
@@ -561,7 +939,10 @@
                     this.ctx.fill();
                 });
 
-                // Update stats
+                this.updateStats(this.vertices.length, this.edges.length);
+            }
+
+            updateStats(vertexCount, edgeCount) {
                 this.frameCount++;
                 const now = performance.now();
                 if (now - this.lastTime >= 1000) {
@@ -571,8 +952,8 @@
                     document.getElementById('fps').textContent = this.fps;
                 }
 
-                document.getElementById('vertexCount').textContent = this.vertices.length;
-                document.getElementById('edgeCount').textContent = this.edges.length;
+                document.getElementById('vertexCount').textContent = vertexCount;
+                document.getElementById('edgeCount').textContent = edgeCount;
             }
 
             // Animation loop
@@ -582,9 +963,13 @@
                 // Generate current shape
                 this.shapeGenerators[this.currentShape](this.time);
 
-                // Auto-rotate
-                this.rotationY += 0.005 * this.rotationSpeed;
-                this.rotationX += 0.002 * this.rotationSpeed;
+                // Auto-rotate (the ocean camera just pans slowly)
+                if (this.isSurface) {
+                    this.rotationY += 0.0006 * this.rotationSpeed;
+                } else {
+                    this.rotationY += 0.005 * this.rotationSpeed;
+                    this.rotationX += 0.002 * this.rotationSpeed;
+                }
 
                 this.render();
                 this.animationId = requestAnimationFrame(() => this.animate());
@@ -605,6 +990,7 @@
 
             setShape(index) {
                 this.currentShape = index;
+                this.isSurface = this.surfaceShapes.has(index);
                 this.time = 0;
                 this.rotationX = 0;
                 this.rotationY = 0;
@@ -621,6 +1007,10 @@
 
             setZoom(zoom) {
                 this.zoom = zoom;
+            }
+
+            setWaveScale(value) {
+                this.waveScale = value / 100;
             }
         }
 
@@ -648,6 +1038,10 @@
             {
                 name: "Morphing Torus Knot",
                 description: "A torus knot is a knot that lies on the surface of a torus. This version continuously morphs its parameters, transitioning smoothly between different knot configurations while adding a twist animation that emphasizes its 3D structure."
+            },
+            {
+                name: "Ocean Waves",
+                description: "A sunset sea built from six overlapping Gerstner waves, which give sharp crests and wide, rounded troughs. Each patch is shaded with Fresnel sky reflection, sun glints, light glowing through backlit crests, whitecap foam and distance fog. Drag to look around, and use Wave Height to go from calm water to a rough sea."
             }
         ];
 
@@ -664,6 +1058,16 @@
             renderer.setShape(index);
             document.getElementById('shapeName').textContent = shapeInfo[index].name;
             document.getElementById('shapeDescription').textContent = shapeInfo[index].description;
+            document.body.classList.toggle('show-surface', renderer.isSurface);
+            document.getElementById('edgeLabel').textContent = renderer.isSurface ? 'Faces' : 'Edges';
+        });
+
+        document.getElementById('waveSlider').addEventListener('input', (e) => {
+            renderer.setWaveScale(parseInt(e.target.value));
+        });
+
+        document.getElementById('wireToggle').addEventListener('change', (e) => {
+            renderer.showWireframeOverlay = e.target.checked;
         });
 
         document.getElementById('speedSlider').addEventListener('input', (e) => {
