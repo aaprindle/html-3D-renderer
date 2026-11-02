@@ -54,6 +54,13 @@ The moon drives the same scattering model as the sun, and its sky pass is added 
 
 The boat's heave, pitch and roll come from **asynchronous GPU probes** (read back through a pixel buffer and a fence). Choppy waves move water sideways, so each probe inverts the horizontal displacement by fixed-point iteration, x₀ ← x − D(x₀). It samples the cascades at the mip level that matches the hull's size, so the hull averages out ripples smaller than itself. Damped springs give it inertia.
 
+### Spray, reflections and performance
+
+- **Bow spray:** a stateless GPU particle system. Each droplet is a pure function of its id and time, thrown off the bow flare and falling ballistically.
+- **Reflections:** the boat is mirrored about the probed water level into a half-resolution planar reflection.
+- **Dynamic resolution:** this keeps the frame rate steady on slower GPUs. Where `EXT_disjoint_timer_query_webgl2` is available, the HUD also shows the measured GPU time per frame.
+- **Ripples with the boat off:** the simulation window follows the camera's view, so clicking anywhere in view makes ripples.
+
 ### Controls
 
 - Drag to look or orbit, scroll to zoom.
