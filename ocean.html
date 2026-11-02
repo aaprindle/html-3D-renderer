@@ -849,7 +849,12 @@ float meanFresnel(float cosV, float sigmaV) {
     return 0.02 + 0.98 * pow(1.0 - cosV, 5.0 * exp(-2.69 * sigmaV)) / (1.0 + 22.7 * pow(sigmaV, 1.5));
 }
 
-float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+// Sine-free hash (Hoskins): cheaper than fract(sin()) and stable on all GPUs
+float hash(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
 float vnoise(vec2 p) {
     vec2 i = floor(p), f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
@@ -860,6 +865,7 @@ float fbm(vec2 p) {
     for (int i = 0; i < 4; i++) { s += a * vnoise(p); p = p * 2.07 + vec2(1.7, 9.2); a *= 0.5; }
     return s / 0.9375;
 }
+float fbm2(vec2 p) { return (vnoise(p) * 0.5 + vnoise(p * 2.07 + vec2(1.7, 9.2)) * 0.25) / 0.75; }
 
 void main() {
     vec2 w = toWind(vXZ);
@@ -910,7 +916,10 @@ void main() {
     vec4 refl = texture(uRefl, ruv);
     skyR = mix(skyR, refl.rgb, refl.a * (1.0 - smoothstep(0.08, 0.3, sigma)));
 
-    vec3 sun = uSunE * reflectedSun(L, V, N, Tx, Ty, var) + uMoonE * reflectedSun(uMoonDir, V, N, Tx, Ty, var);
+    // Uniform branches: only evaluate the lights that are actually up
+    vec3 sun = vec3(0.0);
+    if (uSunE.g > 1e-5) sun += uSunE * reflectedSun(L, V, N, Tx, Ty, var);
+    if (uMoonE.g > 0.0) sun += uMoonE * reflectedSun(uMoonDir, V, N, Tx, Ty, var);
 
     // Light from below the surface + forward scattering through thin crests
     vec3 skyAmb = textureLod(uSky, vec2(0.5, 0.85), 9.0).rgb * PI;
@@ -929,17 +938,22 @@ void main() {
 
     vec3 col = F * skyR + sun + (1.0 - F) * (up + scatter);
 
+    // Derivatives must be taken in uniform control flow, before any branch
+    float footprint = length(fwidth(vXZ));
+
     // Whitecaps: stage A (breaking now) and stage B (decaying streaks)
     if (uFoamOn > 0.5) {
         vec2 f0 = texture(uFoam0, w / uL.x).rg, f1 = texture(uFoam1, w / uL.y).rg * 0.7;
         float breaking = f0.g + f1.g + wakeFoam.g;
         float residual = f0.r + f1.r + wakeFoam.r * 0.75;
+        float detail = 0.0;
+        // Most of the sea has no foam: skip all procedural work there
+        if (breaking + residual > 0.004) {
 
         // Footprint-aware detail: patterns fade to their mean when sub-pixel
-        float footprint = length(fwidth(vXZ));
-        float detail = 1.0 - smoothstep(0.3, 1.5, footprint);
+        detail = 1.0 - smoothstep(0.3, 1.5, footprint);
         vec2 q = w * vec2(0.6, 1.0);   // streaks stretched along the wind
-        vec2 warp = vec2(fbm(q * 0.35), fbm(q * 0.35 + 5.2)) * 3.0;
+        vec2 warp = vec2(fbm2(q * 0.35), fbm2(q * 0.35 + 5.2)) * 3.0;
         float r1 = abs(fbm(q * 0.9 + warp) - 0.5) * 2.0;
         float r2 = abs(fbm(q * 2.3 + warp * 1.7 + 3.3) - 0.5) * 2.0;
         float lace = min(r1, r2 * 1.3);
@@ -953,13 +967,14 @@ void main() {
 
         vec3 foamC = vec3(0.8) * (0.85 + 0.3 * (n - 0.5)) * (uSunE * max(dot(N, L), 0.0) + skyAmb) / PI;
         col = mix(col, foamC, cov);
+        }
 
         // Bioluminescence: dinoflagellates flash where the water is churned
         // (wake breaking, stern wash, steep wake slopes, breaking crests)
         if (uBio > 0.0) {
             float stir = wakeFoam.g * 1.6 + wakeFoam.r * 0.7 + (f0.g + f1.g) * 0.25;
             stir += clamp(length(mean - (s0.xy + s1.xy + s2.xy)) * 6.0 - 0.15, 0.0, 1.0) * wm;
-            float sparkle = mix(1.0, 0.5 + fbm(vXZ * 4.0 + uHs) * 1.2, detail);
+            float sparkle = mix(1.0, 0.5 + fbm2(vXZ * 4.0 + uHs) * 1.2, detail);
             col += vec3(0.05, 0.75, 1.0) * 0.009 * stir * sparkle * uBio;
         }
     }
@@ -1743,7 +1758,8 @@ function updateSun() {
     // A full moon opposite the sun, a little above the horizon
     const moonEl = 14 + Math.max(0, -P.sunEl) * 1.5;
     sun.moonDir = dirFromAngles(moonEl, P.sunAz + 165);
-    sun.moonE = transmittance(sun.moonDir).map((t, i) => SUN_I * MOON_F * t * [1.0, 0.96, 0.88][i]);
+    const moonVis = Math.min(1, Math.max(0, (3 - P.sunEl) / 3));    // negligible beside daylight
+    sun.moonE = transmittance(sun.moonDir).map((t, i) => SUN_I * MOON_F * t * [1.0, 0.96, 0.88][i] * moonVis);
     sun.moonDisk = sun.moonE.map(e => e * 40);
     sun.night = Math.min(1, Math.max(0, (2 - P.sunEl) / 6));
     sun.dirty = true;
@@ -1882,10 +1898,31 @@ function simulateWake(dt) {
     assembleLayer(wake, res, 0.9, dt, { threshold: 0.55, gain: 4, decay: 0.2, shift, boat: P.boat ? rel : null });
 }
 
+// Stage profiler (off by default): gl.finish() between stages so wall time
+// is attributable per stage. Used for the performance budget in the README.
+const prof = { on: false, t: 0, rec: {} };
+const syncPixel = new Float32Array(4);
+function hardSync() {
+    // A 1-pixel readback drains the whole command queue (finish() may not)
+    const prev = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, probeFBO);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, syncPixel);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prev);
+}
+function mark(name) {
+    if (!prof.on) return;
+    hardSync();
+    const t = performance.now();
+    prof.rec[name] = (prof.rec[name] || 0) + t - prof.t;
+    prof.t = t;
+}
+
 function simulate(time, dt) {
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
+    mark('cpu+setup');
     simulateWake(dt);
+    mark('wake solver (2 FFTs)');
     for (let ci = 0; ci < cascades.length; ci++) {
         const c = cascades[ci];
         const pr = progs.spectrum;
@@ -1901,6 +1938,7 @@ function simulate(time, dt) {
         const z = probit(Math.max(spectrumStats.whitecap, 1e-5));
         assembleLayer(c, res, P.chop, dt, { threshold: ci === 2 ? -1 : 1 + z * sj, gain: 1.5 / sj, decay: 0.45 });
     }
+    mark('wind cascades (3 FFTs)');
 }
 
 // Shared uniforms for anything that samples the ocean displacement
@@ -2018,6 +2056,7 @@ function render() {
     lastViewProj = viewProj;
 
     if (sun.dirty) renderSkyLut();
+    mark('sky LUT');
 
     const haze = P.haze;
     const betaExt = [5.8e-6 + 2.3e-5 * haze, 13.5e-6 + 2.3e-5 * haze, 33.1e-6 + 2.3e-5 * haze];
@@ -2035,6 +2074,7 @@ function render() {
         gl.disable(gl.DEPTH_TEST);
     }
 
+    mark('boat reflection');
     // ---- Scene into multisampled HDR target ----
     gl.bindFramebuffer(gl.FRAMEBUFFER, targets.msFBO);
     gl.viewport(0, 0, W, H);
@@ -2056,8 +2096,10 @@ function render() {
 
     gl.enable(gl.DEPTH_TEST);
 
+    mark('sky');
     // Boat
     if (P.boat) drawBoat(viewProj, boatModel(), 1e9, betaExt);
+    mark('boat');
 
     // Ocean: projected grid limited to the visible part of the sea plane
     const hz = M4.transform(viewProj, [cam.pos[0] + Math.sin(cam.yaw) * 1e6, 0, cam.pos[2] + Math.cos(cam.yaw) * 1e6, 1]);
@@ -2102,6 +2144,7 @@ function render() {
         gl.drawElements(gl.TRIANGLES, grid.count, gl.UNSIGNED_INT, 0);
     }
 
+    mark('ocean surface');
     // Bow spray (depth-tested, no depth writes, premultiplied blending)
     if (P.boat && P.spray && boat.speed > 1.5) {
         pr = progs.spray;
@@ -2132,11 +2175,13 @@ function render() {
     gl.bindVertexArray(null);
     gl.disable(gl.DEPTH_TEST);
 
+    mark('spray');
     // Resolve MSAA
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, targets.msFBO);
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, targets.hdrFBO);
     gl.blitFramebuffer(0, 0, W, H, 0, 0, W, H, gl.COLOR_BUFFER_BIT, gl.NEAREST);
 
+    mark('MSAA resolve');
     // ---- Bloom ----
     if (P.bloom) {
         pr = progs.down;
@@ -2162,6 +2207,7 @@ function render() {
         gl.disable(gl.BLEND);
     }
 
+    mark('bloom');
     // ---- Composite to screen ----
     pr = progs.composite;
     gl.useProgram(pr.p);
@@ -2175,6 +2221,7 @@ function render() {
     gl.viewport(0, 0, W, H);
     gl.bindVertexArray(emptyVAO);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    mark('composite');
 }
 
 // =====================================================================
@@ -2441,6 +2488,7 @@ function step(dt, sync) {
     updateCamera(dt);
     simulate(simTime, Math.max(sdt, 1e-4));
     runProbes(sync);
+    mark('probes');
 }
 
 function frame(now) {
@@ -2505,7 +2553,41 @@ function clearWake() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-window.__ocean = { P, cam, boat, clearWake, glError: () => gl.getError(), cascades, wake, applyPreset, PRESETS, spectrumStats, sun, updateSun, still, readTex,
+// Calibration: a fullscreen pass with a known number of FMAs per pixel
+const BENCH_FS = COMMON + `
+in vec2 vUv;
+uniform float uSeed;
+out vec4 o;
+void main() {
+    vec4 a = vec4(vUv, uSeed, 1.0), b = vec4(0.999, 1.001, 0.998, 1.0), c = vec4(1e-3);
+    for (int i = 0; i < 256; i++) { a = a * b + c; a = a * b - c; }   // 512 vec4 FMA = 4096 flops
+    o = a;
+}`;
+function benchmark(size = 512, reps = 3) {
+    const pr = program(FULLSCREEN_VS, BENCH_FS);
+    const t = makeTex(size, size);
+    const f = makeFBO([t]);
+    gl.useProgram(pr.p);
+    gl.uniform1f(pr.u.uSeed, 0.5);
+    drawFullscreen(f); hardSync();
+    const t0 = performance.now();
+    for (let i = 0; i < reps; i++) { gl.uniform1f(pr.u.uSeed, i); drawFullscreen(f); }
+    hardSync();
+    const sec = (performance.now() - t0) / 1000;
+    gl.deleteFramebuffer(f); gl.deleteTexture(t);
+    return size * size * 4096 * reps / sec / 1e9;   // GFLOP/s
+}
+function profileFrame(n = 3) {
+    prof.rec = {};
+    prof.on = true;
+    for (let i = 0; i < n; i++) { hardSync(); prof.t = performance.now(); step(1 / 30, true); render(); }
+    prof.on = false;
+    const out = {};
+    for (const k in prof.rec) out[k] = prof.rec[k] / n;
+    return out;
+}
+
+window.__ocean = { gl, buildGrid, P, cam, boat, clearWake, benchmark, profileFrame, glError: () => gl.getError(), cascades, wake, applyPreset, PRESETS, spectrumStats, sun, updateSun, still, readTex,
     splash: (x, z) => { pendingSplash = { x, z }; },
     resume: () => { if (!running) { running = true; last = performance.now(); requestAnimationFrame(frame); } } };
 requestAnimationFrame(frame);

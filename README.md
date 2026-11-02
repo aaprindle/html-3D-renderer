@@ -61,6 +61,31 @@ The boat's heave, pitch and roll come from **asynchronous GPU probes** (read bac
 - **Dynamic resolution:** this keeps the frame rate steady on slower GPUs. Where `EXT_disjoint_timer_query_webgl2` is available, the HUD also shows the measured GPU time per frame.
 - **Ripples with the boat off:** the simulation window follows the camera's view, so clicking anywhere in view makes ripples.
 
+### Performance budget
+
+There is no GPU in the development container, so these numbers come from profiling under SwiftShader, Chromium's CPU-based software renderer. The page has a built-in stage profiler: `__ocean.profileFrame()` reads back one pixel between stages to force each to finish. It also has a calibration shader, `__ocean.benchmark()`, with 4,096 FLOPs per pixel, which measured **31.6 GFLOP/s** on this machine.
+
+| Stage (1920×1080, High) | SwiftShader ms |
+|---|---|
+| Wake solver (forward + inverse 256² FFT, sources, k-space step) | 46 |
+| Three wind cascades (spectrum, 256² FFTs, assemble, foam, mips) | 72 |
+| Probes, sky LUT, boat, reflection, spray | 42 |
+| Sky background | 180 |
+| Ocean surface | 3,255 |
+| MSAA resolve, bloom, composite | 230 |
+
+Of the ocean surface's 3.3 s, about 2.5 s is work that real GPUs do in fixed-function hardware or barely notice. That's the 172k-vertex projected grid, at about 0.3 ms on a GPU, and 16× anisotropic filtering. Fragment shading alone is 0.7 s.
+
+The total shading work is about 1.3 s. That projects to a real GPU two ways:
+
+- **Pass-ratio scaling:** the sky pass, one lookup-texture read per pixel, takes 180 ms here against roughly 0.2–0.5 ms on GPUs. Scaling by that ratio gives **about 1.5–3 ms per 1080p frame**.
+- **Worst case:** counting every operation as plain arithmetic gives about 40 GFLOP-equivalent per frame. That's about 3 ms on a desktop GPU like an RTX 3060, and up to about 40 ms on integrated graphics. In that case dynamic resolution brings the pixel count down to about a quarter.
+
+Profiling led to two optimisations:
+
+- The foam shader now skips foam-free pixels with an early branch and uses a sine-free hash; this halved its cost.
+- The sun and moon BRDFs only run when that light is actually up.
+
 ### Controls
 
 - Drag to look or orbit, scroll to zoom.
